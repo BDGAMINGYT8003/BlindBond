@@ -4,12 +4,17 @@ This is a simple Telegram bot built with Node.js and Telegraf that anonymously c
 
 ## Features
 
-*   **/new**: Starts a search for a chat partner. If another user is also waiting, a session is established.
-*   **/end**: Terminates the current chat session for both users.
+*   **`/start`**: Displays a welcoming message and basic instructions on how to use the bot.
+*   **`/new`**: Starts a search for a chat partner. If another user is also waiting, a session is established.
+*   **`/end`**: Terminates the current chat session for both users.
 *   **Anonymous Messaging**: Messages sent to the bot by one user in a session are forwarded to the other user.
-*   **Rate Limiting**: Prevents users from sending messages too quickly.
+*   **Share Username**: During an active chat, users are presented with an inline button ('✨ Offer to Share Username') to share their Telegram username with their chat partner. This involves a confirmation step. If confirmed, the user's clickable @username is sent to the partner.
+*   **Conversation Summary**: At the end of each chat (whether ended by `/end` or due to an error like message delivery failure), both users receive a summary. This summary includes the chat duration and the total number of messages exchanged during the session.
+*   **Command Blocking**: Messages starting with `/` are recognized as potential Telegram commands and are not forwarded to the chat partner. The sender is notified about this. This prevents accidental command invocation or confusion.
+*   **Rate Limiting**: Prevents users from sending messages too quickly, helping to reduce spam.
 *   **Message Length Cap**: Restricts the maximum length of messages.
-*   **Basic Content Filtering**: Scans messages for a predefined list of prohibited keywords and blocks them.
+*   **Basic Content Filtering**: Scans messages for a predefined list of prohibited keywords. If found, the message is blocked, and the sender is warned.
+*   **Enhanced User Experience**: User-facing messages have been refined for clarity and consistently use Telegram's MarkdownV2 for better formatting and readability (e.g., bolding, italics, inline code for commands).
 
 ## Prerequisites
 
@@ -49,25 +54,28 @@ This is a simple Telegram bot built with Node.js and Telegraf that anonymously c
 
 ## How it Works
 
-*   Users send `/new` to enter a waiting queue.
-*   When two users are in the queue, they are paired, and a chat session begins.
-*   Text messages sent to the bot are forwarded to the paired user.
-*   The `/end` command terminates the session.
-*   User states (idle, waiting, chatting) and active sessions are managed in memory. This means if the bot restarts, all active sessions and waiting users are lost.
+*   Users send `/start` for a welcome message or `/new` to enter a waiting queue.
+*   When two users are in the queue, they are paired, and a chat session begins. Session metadata like start time and message count is initialized.
+*   Text messages sent to the bot (not starting with `/`) are forwarded to the paired user. The message count for the session is incremented.
+*   Users can offer to share their username using an inline button.
+*   The `/end` command terminates the session. A conversation summary is then displayed to both users.
+*   User states (idle, waiting, chatting) and active sessions (linking user IDs and detailed metadata like start times, message counts, and usernames) are managed in memory. This means if the bot restarts, all active sessions and waiting users are lost.
 
 ## Safety Features
 
 *   Users cannot start a new session if already in one or waiting.
 *   Commands are generally rejected if used out of context (e.g., `/end` when not in a chat).
+*   Messages starting with `/` are not forwarded during a chat.
 *   Message rate limiting and length caps are in place to prevent spam.
 *   A basic keyword filter checks messages for prohibited content. If found, the message is blocked, and the sender is warned.
-*   The bot attempts to handle Telegram API errors gracefully (e.g., if a message can't be delivered to a partner, the session may be terminated).
-*   Communication is private between the two paired users during a session. Message contents are not stored long-term. User identifiers are used for session management but are not logged in a way that links them to message content beyond what's required for moderation of prohibited content.
+*   The bot attempts to handle Telegram API errors gracefully (e.g., if a message can't be delivered to a partner, the session may be terminated, and a summary provided).
+*   Communication is private between the two paired users during a session. Message contents are not stored long-term. User identifiers are used for session management but are not logged in a way that links them to message content beyond what's required for moderation of prohibited content or sharing usernames upon user consent.
 
 ## Future Enhancements (Not Implemented)
 
 *   Persistent sessions across bot restarts (using a database or file storage).
-*   More sophisticated content moderation and user reputation system.
+*   More sophisticated content moderation and user reputation system (e.g., tracking warnings, temporary bans).
 *   "Typing..." indicators.
-*   Allowing users to report their chat partners.
-*   Inline buttons for commands like `/end`.
+*   Allowing users to report their chat partners for misconduct.
+*   More granular user controls (e.g., blocking a partner after username share).
+*   Localization/multi-language support.
