@@ -57,7 +57,8 @@ const formatDuration = (milliseconds) => {
 
 // Reply keyboards
 const chatActiveKeyboard = Markup.keyboard([
-  ['🔗 Share Username']
+  ['🔗 Share Username'],
+  ['🔄 End & Find New', '❌ End Chat']
 ]).resize().oneTime();
 
 const shareConfirmKeyboard = Markup.inlineKeyboard([
@@ -103,14 +104,14 @@ const sendConversationSummary = async (userId, partnerId, sessionId, reason = 'e
 ⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
 💬 *Total messages exchanged:* ${messageCount}
 
-Use /new to start a new conversation\\.`;
+Use /find to start a new conversation\\.`;
   } else {
     summaryMessage = `🔚 *The conversation has officially concluded\\.*
 
 ⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
 💬 *Total messages exchanged:* ${messageCount}
 
-Thanks for using Anonymous Chat Bot\\! Use /new to start a new conversation\\.`;
+Thanks for using Anonymous Chat Bot\\! Use /find to start a new conversation\\.`;
   }
   
   // Send to both users
@@ -159,29 +160,8 @@ const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') =>
   }
 };
 
-// Error handling
-bot.catch((err, ctx) => {
-  console.error(`Bot error:`, err);
-  ensureUserInitialized(ctx);
-});
-
-// Start command
-bot.start((ctx) => {
-  ensureUserInitialized(ctx);
-  
-  const welcomeMessage = `🤖 *Welcome to Anonymous Chat Bot\\!*
-
-🔍 Use /new to find a random chat partner
-🛑 Use /end to finish your current conversation
-📝 Messages are forwarded anonymously between partners
-
-*Stay respectful and enjoy chatting\\!*`;
-
-  ctx.replyWithMarkdownV2(welcomeMessage, { reply_markup: removeKeyboard.reply_markup });
-});
-
-// New chat command
-bot.command('new', async (ctx) => {
+// Find partner function (extracted for reuse)
+const findPartner = async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
   
@@ -264,10 +244,10 @@ bot.command('new', async (ctx) => {
       }
     }, 500); // 500ms delay to ensure proper ordering
   }
-});
+};
 
-// End chat command
-bot.command('end', async (ctx) => {
+// End chat function (extracted for reuse)
+const endChat = async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
   
@@ -275,7 +255,7 @@ bot.command('end', async (ctx) => {
   const userData = users.get(userId);
   
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /new to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /find to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
   const partnerId = sessions.get(userId);
@@ -284,9 +264,36 @@ bot.command('end', async (ctx) => {
   console.log(`Session ended by user ${userId}. Session: ${sessionId}`);
   
   await cleanupSession(userId, partnerId, sessionId, 'ended');
+};
+
+// Error handling
+bot.catch((err, ctx) => {
+  console.error(`Bot error:`, err);
+  ensureUserInitialized(ctx);
 });
 
-// Handle reply keyboard button
+// Start command
+bot.start((ctx) => {
+  ensureUserInitialized(ctx);
+  
+  const welcomeMessage = `🤖 *Welcome to Anonymous Chat Bot\\!*
+
+🔍 Use /find to find a random chat partner
+🛑 Use /end to finish your current conversation
+📝 Messages are forwarded anonymously between partners
+
+*Stay respectful and enjoy chatting\\!*`;
+
+  ctx.replyWithMarkdownV2(welcomeMessage, { reply_markup: removeKeyboard.reply_markup });
+});
+
+// Find chat command (renamed from /new)
+bot.command('find', findPartner);
+
+// End chat command
+bot.command('end', endChat);
+
+// Handle reply keyboard buttons
 bot.hears('🔗 Share Username', async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
@@ -295,15 +302,40 @@ bot.hears('🔗 Share Username', async (ctx) => {
   const userData = users.get(userId);
   
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("❌ *You're not currently in a chat\\.*\n\nUse /new to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+    return ctx.replyWithMarkdownV2("❌ *You're not currently in a chat\\.*\n\nUse /find to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
+  
+  const username = userData.userObject?.username;
+  const displayUsername = username ? `@${username}` : 'your username';
   
   const askMessage = `🤔 *Would you like to share your username?*
 
-Your chat partner will be able to see your @username and contact you directly on Telegram\\.`;
+Your chat partner will be able to see your username ${escapeMarkdown(displayUsername)} and contact you directly on Telegram\\.`;
   
   await ctx.replyWithMarkdownV2(askMessage, { reply_markup: shareConfirmKeyboard.reply_markup });
 });
+
+bot.hears('🔄 End & Find New', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+  
+  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /find to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+  }
+  
+  // End current chat first
+  await endChat(ctx);
+  
+  // Small delay to ensure cleanup is complete
+  setTimeout(async () => {
+    await findPartner(ctx);
+  }, 1000);
+});
+
+bot.hears('❌ End Chat', endChat);
 
 // Message forwarding
 bot.on('text', async (ctx) => {
@@ -323,15 +355,15 @@ bot.on('text', async (ctx) => {
   }
   
   // Block reply keyboard button text from being forwarded
-  if (messageText === '🔗 Share Username') {
-    return; // This is handled by the hears handler above
+  if (messageText === '🔗 Share Username' || messageText === '🔄 End & Find New' || messageText === '❌ End Chat') {
+    return; // These are handled by the hears handlers above
   }
   
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
     if (userData && userData.state === 'waiting') {
       return ctx.replyWithMarkdownV2("⏳ *Please wait while we find you a chat partner\\.*");
     }
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not in a chat\\.*\n\nUse /new to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not in a chat\\.*\n\nUse /find to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
   const partnerId = sessions.get(userId);
