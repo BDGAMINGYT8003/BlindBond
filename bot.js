@@ -55,17 +55,19 @@ const formatDuration = (milliseconds) => {
   return `${hours} hour${hours === 1 ? '' : 's'} and ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}`;
 };
 
-// Inline keyboards
-const shareUsernameKeyboard = Markup.inlineKeyboard([
-  Markup.button.callback('🔗 Share Username', 'offer_share_username')
-]);
+// Reply keyboards
+const chatActiveKeyboard = Markup.keyboard([
+  ['🔗 Share Username']
+]).resize().oneTime();
 
-const confirmShareKeyboard = Markup.inlineKeyboard([
+const shareConfirmKeyboard = Markup.inlineKeyboard([
   [
     Markup.button.callback('✅ Yes', 'share_yes'),
     Markup.button.callback('❌ No', 'share_no')
   ]
 ]);
+
+const removeKeyboard = Markup.removeKeyboard();
 
 // Initialize user helper
 const ensureUserInitialized = (ctx) => {
@@ -83,6 +85,78 @@ const ensureUserInitialized = (ctx) => {
   }
   
   return users.get(userId);
+};
+
+// Send conversation summary
+const sendConversationSummary = async (userId, partnerId, sessionId, reason = 'ended') => {
+  if (!sessionDetails.has(sessionId)) return;
+  
+  const details = sessionDetails.get(sessionId);
+  const duration = new Date() - details.startTime;
+  const formattedDuration = formatDuration(duration);
+  const messageCount = details.messageCount;
+  
+  let summaryMessage;
+  if (reason === 'error') {
+    summaryMessage = `🔚 *The conversation has ended due to a connection issue\\.*
+
+⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
+💬 *Total messages exchanged:* ${messageCount}
+
+Use /new to start a new conversation\\.`;
+  } else {
+    summaryMessage = `🔚 *The conversation has officially concluded\\.*
+
+⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
+💬 *Total messages exchanged:* ${messageCount}
+
+Thanks for using Anonymous Chat Bot\\! Use /new to start a new conversation\\.`;
+  }
+  
+  // Send to both users
+  try {
+    await bot.telegram.sendMessage(userId, summaryMessage, { 
+      parse_mode: 'MarkdownV2',
+      reply_markup: removeKeyboard.reply_markup 
+    });
+  } catch (error) {
+    console.error(`Failed to send summary to user ${userId}:`, error);
+  }
+  
+  try {
+    await bot.telegram.sendMessage(partnerId, summaryMessage, { 
+      parse_mode: 'MarkdownV2',
+      reply_markup: removeKeyboard.reply_markup 
+    });
+  } catch (error) {
+    console.error(`Failed to send summary to partner ${partnerId}:`, error);
+  }
+  
+  sessionDetails.delete(sessionId);
+};
+
+// Clean up session
+const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') => {
+  // Send summary first
+  await sendConversationSummary(userId, partnerId, sessionId, reason);
+  
+  // Clean up session data
+  sessions.delete(userId);
+  sessions.delete(partnerId);
+  
+  // Update user states
+  const user1Data = users.get(userId);
+  const user2Data = users.get(partnerId);
+  
+  if (user1Data) {
+    user1Data.state = 'idle';
+    users.set(userId, user1Data);
+  }
+  
+  if (user2Data) {
+    user2Data.state = 'idle';
+    users.set(partnerId, user2Data);
+  }
 };
 
 // Error handling
@@ -103,11 +177,11 @@ bot.start((ctx) => {
 
 *Stay respectful and enjoy chatting\\!*`;
 
-  ctx.replyWithMarkdownV2(welcomeMessage);
+  ctx.replyWithMarkdownV2(welcomeMessage, { reply_markup: removeKeyboard.reply_markup });
 });
 
 // New chat command
-bot.command('new', (ctx) => {
+bot.command('new', async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
   
@@ -115,13 +189,16 @@ bot.command('new', (ctx) => {
   
   // Check if already in chat
   if (sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("❌ *You're already in a chat\\!* Use /end to finish your current conversation first\\.");
+    return ctx.replyWithMarkdownV2("❌ *You're already in a chat\\!* Use /end to finish your current conversation first\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
   // Check if already waiting
   if (waitingQueue.includes(userId)) {
-    return ctx.replyWithMarkdownV2("⏳ *You're already searching for a partner\\.*\n\nPlease wait while we find someone for you\\.");
+    return ctx.replyWithMarkdownV2("⏳ *You're already searching for a partner\\.*\n\nPlease wait while we find someone for you\\.", { reply_markup: removeKeyboard.reply_markup });
   }
+  
+  // Send search message first
+  await ctx.replyWithMarkdownV2("🔍 *Searching for a chat partner\\.\\.\\.*\n\n⏳ Please wait while we connect you\\.", { reply_markup: removeKeyboard.reply_markup });
   
   // Add to waiting queue
   userCtx.state = 'waiting';
@@ -129,7 +206,6 @@ bot.command('new', (ctx) => {
   waitingQueue.push(userId);
   
   console.log(`User ${userId} entered waiting queue`);
-  ctx.replyWithMarkdownV2("🔍 *Searching for a chat partner\\.\\.\\.*\n\n⏳ Please wait while we connect you\\.");
   
   // Try to pair users
   if (waitingQueue.length >= 2) {
@@ -165,23 +241,33 @@ bot.command('new', (ctx) => {
     
     console.log(`Session started: ${sessionId}`);
     
-    // Notify both users
-    const connectMessage = `🎉 *You're now connected with a stranger\\!*\n\n💬 Start chatting by sending a message\\.\n🔗 Use the button below to share your username if you want\\.`;
-    
-    bot.telegram.sendMessage(user1Id, connectMessage, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: shareUsernameKeyboard.reply_markup
-    }).catch(console.error);
-    
-    bot.telegram.sendMessage(user2Id, connectMessage, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: shareUsernameKeyboard.reply_markup
-    }).catch(console.error);
+    // Small delay to ensure proper message ordering
+    setTimeout(async () => {
+      // Notify both users with reply keyboard
+      const connectMessage = `🎉 *You're now connected with a stranger\\!*
+
+💬 Start chatting by sending a message\\.
+🔗 Use the button below to share your username if you want\\.`;
+      
+      try {
+        await bot.telegram.sendMessage(user1Id, connectMessage, {
+          parse_mode: 'MarkdownV2',
+          reply_markup: chatActiveKeyboard.reply_markup
+        });
+        
+        await bot.telegram.sendMessage(user2Id, connectMessage, {
+          parse_mode: 'MarkdownV2',
+          reply_markup: chatActiveKeyboard.reply_markup
+        });
+      } catch (error) {
+        console.error('Failed to send connection messages:', error);
+      }
+    }, 500); // 500ms delay to ensure proper ordering
   }
 });
 
 // End chat command
-bot.command('end', (ctx) => {
+bot.command('end', async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
   
@@ -189,7 +275,7 @@ bot.command('end', (ctx) => {
   const userData = users.get(userId);
   
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /new to start a new conversation\\.");
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /new to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
   const partnerId = sessions.get(userId);
@@ -197,46 +283,26 @@ bot.command('end', (ctx) => {
   
   console.log(`Session ended by user ${userId}. Session: ${sessionId}`);
   
-  // Send conversation summary
-  if (sessionDetails.has(sessionId)) {
-    const details = sessionDetails.get(sessionId);
-    const duration = new Date() - details.startTime;
-    const formattedDuration = formatDuration(duration);
-    const messageCount = details.messageCount;
-    
-    const summaryMessage = `🔚 *The conversation has officially concluded\\.*
+  await cleanupSession(userId, partnerId, sessionId, 'ended');
+});
 
-⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
-💬 *Total messages exchanged:* ${messageCount}
+// Handle reply keyboard button
+bot.hears('🔗 Share Username', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+  
+  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
+    return ctx.replyWithMarkdownV2("❌ *You're not currently in a chat\\.*\n\nUse /new to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+  }
+  
+  const askMessage = `🤔 *Would you like to share your username?*
 
-Thanks for using Anonymous Chat Bot\\! Use /new to start a new conversation\\.`;
-    
-    // Send to both users
-    bot.telegram.sendMessage(userId, summaryMessage, { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
-    bot.telegram.sendMessage(partnerId, summaryMessage, { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
-    
-    sessionDetails.delete(sessionId);
-  }
+Your chat partner will be able to see your @username and contact you directly on Telegram\\.`;
   
-  // Clean up session
-  sessions.delete(userId);
-  sessions.delete(partnerId);
-  
-  // Update user states
-  const user1Data = users.get(userId);
-  const user2Data = users.get(partnerId);
-  
-  if (user1Data) {
-    user1Data.state = 'idle';
-    users.set(userId, user1Data);
-  }
-  
-  if (user2Data) {
-    user2Data.state = 'idle';
-    users.set(partnerId, user2Data);
-  }
+  await ctx.replyWithMarkdownV2(askMessage, { reply_markup: shareConfirmKeyboard.reply_markup });
 });
 
 // Message forwarding
@@ -256,11 +322,16 @@ bot.on('text', async (ctx) => {
     return; // Let Telegraf handle the command normally
   }
   
+  // Block reply keyboard button text from being forwarded
+  if (messageText === '🔗 Share Username') {
+    return; // This is handled by the hears handler above
+  }
+  
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
     if (userData && userData.state === 'waiting') {
       return ctx.replyWithMarkdownV2("⏳ *Please wait while we find you a chat partner\\.*");
     }
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not in a chat\\.*\n\nUse /new to start a conversation\\.");
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not in a chat\\.*\n\nUse /new to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
   const partnerId = sessions.get(userId);
@@ -308,75 +379,11 @@ bot.on('text', async (ctx) => {
     
     // End session due to delivery failure
     const sessionId = [userId, partnerId].sort().join('-');
-    
-    if (sessionDetails.has(sessionId)) {
-      const details = sessionDetails.get(sessionId);
-      const duration = new Date() - details.startTime;
-      const formattedDuration = formatDuration(duration);
-      
-      const errorSummary = `🔚 *The conversation has ended due to a connection issue\\.*
-
-⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
-💬 *Total messages exchanged:* ${details.messageCount}
-
-Use /new to start a new conversation\\.`;
-      
-      ctx.replyWithMarkdownV2(errorSummary).catch(console.error);
-      bot.telegram.sendMessage(partnerId, errorSummary, { parse_mode: 'MarkdownV2' })
-        .catch(console.error);
-      
-      sessionDetails.delete(sessionId);
-    }
-    
-    // Clean up session
-    sessions.delete(userId);
-    sessions.delete(partnerId);
-    
-    const user1Data = users.get(userId);
-    const user2Data = users.get(partnerId);
-    
-    if (user1Data) {
-      user1Data.state = 'idle';
-      users.set(userId, user1Data);
-    }
-    
-    if (user2Data) {
-      user2Data.state = 'idle';
-      users.set(partnerId, user2Data);
-    }
+    await cleanupSession(userId, partnerId, sessionId, 'error');
   }
 });
 
-// Inline keyboard handlers
-bot.action('offer_share_username', async (ctx) => {
-  const userId = ctx.from.id;
-  ensureUserInitialized(ctx);
-  
-  const userData = users.get(userId);
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    await ctx.answerCbQuery('This chat is no longer active.');
-    return ctx.editMessageText('❌ This chat session is no longer active\\.', { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
-  }
-  
-  await ctx.answerCbQuery();
-  
-  const askMessage = `🤔 *Would you like to share your username?*
-
-Your chat partner will be able to see your @username and contact you directly on Telegram\\.`;
-  
-  try {
-    await ctx.editMessageText(askMessage, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: confirmShareKeyboard.reply_markup
-    });
-  } catch (error) {
-    console.error('Error editing message for username share prompt:', error);
-    ctx.replyWithMarkdownV2(askMessage, { reply_markup: confirmShareKeyboard.reply_markup })
-      .catch(console.error);
-  }
-});
-
+// Inline keyboard handlers for username sharing confirmation
 bot.action('share_yes', async (ctx) => {
   const userId = ctx.from.id;
   ensureUserInitialized(ctx);
