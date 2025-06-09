@@ -12,11 +12,67 @@ const users = new Map(); // userId -> { state: 'idle'/'waiting'/'chatting', user
 const waitingQueue = []; // Array of user IDs waiting for partners
 const sessions = new Map(); // userId -> partnerId
 const sessionDetails = new Map(); // sessionId -> { startTime, messageCount, user1Id, user2Id }
+const usernameShareData = new Map(); // sessionId -> { user1Shares: 0, user2Shares: 0 }
 
 // Rate limiting
 const messageTimestamps = new Map(); // userId -> [timestamps]
 const RATE_LIMIT_WINDOW = 5000; // 5 seconds
 const MAX_MESSAGES_IN_WINDOW = 3;
+
+// Username sharing restrictions
+const USERNAME_SHARE_COOLDOWN = 60000; // 1 minute in milliseconds
+const MAX_USERNAME_SHARES = 2; // Maximum shares per user per session
+
+// Helper function to check if username sharing is allowed
+const canShareUsername = (userId) => {
+  const partnerId = sessions.get(userId);
+  if (!partnerId) return { allowed: false, reason: 'No active chat' };
+  
+  const sessionId = [userId, partnerId].sort().join('-');
+  const sessionData = sessionDetails.get(sessionId);
+  
+  if (!sessionData) return { allowed: false, reason: 'Session not found' };
+  
+  // Check if 1 minute has passed since connection
+  const timeSinceConnection = Date.now() - sessionData.startTime;
+  if (timeSinceConnection < USERNAME_SHARE_COOLDOWN) {
+    const remainingTime = Math.ceil((USERNAME_SHARE_COOLDOWN - timeSinceConnection) / 1000);
+    return { 
+      allowed: false, 
+      reason: 'cooldown', 
+      remainingTime 
+    };
+  }
+  
+  // Check share count
+  const shareData = usernameShareData.get(sessionId) || { user1Shares: 0, user2Shares: 0 };
+  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
+  
+  if (shareData[userKey] >= MAX_USERNAME_SHARES) {
+    return { 
+      allowed: false, 
+      reason: 'limit_reached' 
+    };
+  }
+  
+  return { allowed: true };
+};
+
+// Helper function to increment username share count
+const incrementShareCount = (userId) => {
+  const partnerId = sessions.get(userId);
+  if (!partnerId) return;
+  
+  const sessionId = [userId, partnerId].sort().join('-');
+  const sessionData = sessionDetails.get(sessionId);
+  if (!sessionData) return;
+  
+  const shareData = usernameShareData.get(sessionId) || { user1Shares: 0, user2Shares: 0 };
+  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
+  
+  shareData[userKey]++;
+  usernameShareData.set(sessionId, shareData);
+};
 
 // Content filtering
 const MAX_MESSAGE_LENGTH = 500;
@@ -144,6 +200,7 @@ const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') =>
   // Clean up session data
   sessions.delete(userId);
   sessions.delete(partnerId);
+  usernameShareData.delete(sessionId); // Clean up username share data
   
   // Update user states
   const user1Data = users.get(userId);
@@ -217,6 +274,12 @@ const findPartner = async (ctx) => {
       messageCount: 0,
       user1Id,
       user2Id
+    });
+    
+    // Initialize username share data
+    usernameShareData.set(sessionId, {
+      user1Shares: 0,
+      user2Shares: 0
     });
     
     console.log(`Session started: ${sessionId}`);
@@ -305,12 +368,39 @@ bot.hears('🔗 Share Username', async (ctx) => {
     return ctx.replyWithMarkdownV2("❌ *You're not currently in a chat\\.*\n\nUse /find to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
   }
   
+  // Check if username sharing is allowed
+  const shareCheck = canShareUsername(userId);
+  if (!shareCheck.allowed) {
+    let errorMessage;
+    
+    if (shareCheck.reason === 'cooldown') {
+      errorMessage = `⏰ *Username sharing is not available yet\\.*\n\nYou can share your username after being connected for 1 minute\\.\n\n⏳ Please wait ${shareCheck.remainingTime} more second${shareCheck.remainingTime === 1 ? '' : 's'}\\.`;
+    } else if (shareCheck.reason === 'limit_reached') {
+      errorMessage = `🚫 *Username sharing limit reached\\.*\n\nYou can only share your username ${MAX_USERNAME_SHARES} times per conversation\\.\n\nThis helps maintain user privacy and prevents spam\\.`;
+    } else {
+      errorMessage = "❌ *Username sharing is not available right now\\.*";
+    }
+    
+    return ctx.replyWithMarkdownV2(errorMessage);
+  }
+  
   const username = userData.userObject?.username;
   const displayUsername = username ? `@${username}` : 'your username';
   
+  // Get current share count for display
+  const partnerId = sessions.get(userId);
+  const sessionId = [userId, partnerId].sort().join('-');
+  const sessionData = sessionDetails.get(sessionId);
+  const shareData = usernameShareData.get(sessionId);
+  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
+  const currentShares = shareData[userKey];
+  const remainingShares = MAX_USERNAME_SHARES - currentShares;
+  
   const askMessage = `🤔 *Would you like to share your username?*
 
-Your chat partner will be able to see your username ${escapeMarkdown(displayUsername)} and contact you directly on Telegram\\.`;
+Your chat partner will be able to see your username ${escapeMarkdown(displayUsername)} and contact you directly on Telegram\\.
+
+📊 *Remaining shares:* ${remainingShares}/${MAX_USERNAME_SHARES}`;
   
   await ctx.replyWithMarkdownV2(askMessage, { reply_markup: shareConfirmKeyboard.reply_markup });
 });
@@ -429,6 +519,24 @@ bot.action('share_yes', async (ctx) => {
       .catch(console.error);
   }
   
+  // Double-check sharing restrictions before proceeding
+  const shareCheck = canShareUsername(userId);
+  if (!shareCheck.allowed) {
+    let errorMessage;
+    
+    if (shareCheck.reason === 'cooldown') {
+      errorMessage = `⏰ *Username sharing is not available yet\\.*\n\nPlease wait ${shareCheck.remainingTime} more second${shareCheck.remainingTime === 1 ? '' : 's'}\\.`;
+    } else if (shareCheck.reason === 'limit_reached') {
+      errorMessage = `🚫 *Username sharing limit reached\\.*\n\nYou can only share your username ${MAX_USERNAME_SHARES} times per conversation\\.`;
+    } else {
+      errorMessage = "❌ *Username sharing is not available right now\\.*";
+    }
+    
+    await ctx.answerCbQuery('Sharing not allowed.');
+    return ctx.editMessageText(errorMessage, { parse_mode: 'MarkdownV2' })
+      .catch(console.error);
+  }
+  
   const username = userData.userObject?.username;
   if (!username) {
     await ctx.answerCbQuery('No username found.');
@@ -438,6 +546,17 @@ bot.action('share_yes', async (ctx) => {
   
   await ctx.answerCbQuery('Sharing username...');
   
+  // Increment share count
+  incrementShareCount(userId);
+  
+  // Get updated share count for display
+  const sessionId = [userId, partnerId].sort().join('-');
+  const sessionData = sessionDetails.get(sessionId);
+  const shareData = usernameShareData.get(sessionId);
+  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
+  const currentShares = shareData[userKey];
+  const remainingShares = MAX_USERNAME_SHARES - currentShares;
+  
   // Send username to partner (username in @mention is NOT escaped)
   const partnerMessage = `🔗 *Your chat partner shared their username:*\n\n@${username}\n\nTap to view their profile\\!`;
   
@@ -445,7 +564,13 @@ bot.action('share_yes', async (ctx) => {
     .catch(console.error);
   
   // Confirm to sender (username in display text IS escaped)
-  const confirmMessage = `✅ *Username shared successfully\\!*\n\nYour username @${escapeMarkdown(username)} has been sent to your chat partner\\.`;
+  let confirmMessage = `✅ *Username shared successfully\\!*\n\nYour username @${escapeMarkdown(username)} has been sent to your chat partner\\.`;
+  
+  if (remainingShares > 0) {
+    confirmMessage += `\n\n📊 *Remaining shares:* ${remainingShares}/${MAX_USERNAME_SHARES}`;
+  } else {
+    confirmMessage += `\n\n🚫 *You have reached the maximum sharing limit for this conversation\\.*`;
+  }
   
   await ctx.editMessageText(confirmMessage, { parse_mode: 'MarkdownV2' })
     .catch(console.error);
