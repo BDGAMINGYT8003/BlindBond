@@ -117,6 +117,10 @@ const chatActiveKeyboard = Markup.keyboard([
   ['🔄 End & Find New', '❌ End Chat']
 ]).resize().oneTime();
 
+const searchingKeyboard = Markup.keyboard([
+  ['❌ Cancel Search']
+]).resize().oneTime();
+
 const shareConfirmKeyboard = Markup.inlineKeyboard([
   [
     Markup.button.callback('✅ Yes', 'share_yes'),
@@ -217,6 +221,33 @@ const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') =>
   }
 };
 
+// Cancel search function
+const cancelSearch = async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+  
+  if (!userData || userData.state !== 'waiting') {
+    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently searching for a partner\\.*", { reply_markup: removeKeyboard.reply_markup });
+  }
+  
+  // Remove from waiting queue
+  const queueIndex = waitingQueue.indexOf(userId);
+  if (queueIndex > -1) {
+    waitingQueue.splice(queueIndex, 1);
+    console.log(`User ${userId} cancelled search and removed from queue`);
+  }
+  
+  // Update user state
+  userData.state = 'idle';
+  users.set(userId, userData);
+  
+  // Send confirmation
+  await ctx.replyWithMarkdownV2("✅ *Search cancelled\\.*\n\nYou can use /find to search for a partner again\\.", { reply_markup: removeKeyboard.reply_markup });
+};
+
 // Find partner function (extracted for reuse)
 const findPartner = async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
@@ -231,11 +262,11 @@ const findPartner = async (ctx) => {
   
   // Check if already waiting
   if (waitingQueue.includes(userId)) {
-    return ctx.replyWithMarkdownV2("⏳ *You're already searching for a partner\\.*\n\nPlease wait while we find someone for you\\.", { reply_markup: removeKeyboard.reply_markup });
+    return ctx.replyWithMarkdownV2("⏳ *You're already searching for a partner\\.*\n\nUse the button below to cancel your search\\.", { reply_markup: searchingKeyboard.reply_markup });
   }
   
-  // Send search message first
-  await ctx.replyWithMarkdownV2("🔍 *Searching for a chat partner\\.\\.\\.*\n\n⏳ Please wait while we connect you\\.", { reply_markup: removeKeyboard.reply_markup });
+  // Send search message with cancel option
+  await ctx.replyWithMarkdownV2("🔍 *Searching for a chat partner\\.\\.\\.*\n\n⏳ Please wait while we connect you\\.", { reply_markup: searchingKeyboard.reply_markup });
   
   // Add to waiting queue
   userCtx.state = 'waiting';
@@ -289,7 +320,7 @@ const findPartner = async (ctx) => {
       // Notify both users with reply keyboard
       const connectMessage = `🎉 *You're now connected with a stranger\\!*
 
-💬 Start chatting by sending a message\\.
+💬 Start chatting by sending messages, photos, videos, stickers, or any media\\.
 🔗 Use the button below to share your username if you want\\.`;
       
       try {
@@ -329,6 +360,70 @@ const endChat = async (ctx) => {
   await cleanupSession(userId, partnerId, sessionId, 'ended');
 };
 
+// Helper function to forward media content
+const forwardMedia = async (ctx, partnerId) => {
+  try {
+    // Get the message object
+    const message = ctx.message;
+    
+    // Handle different media types
+    if (message.photo) {
+      await bot.telegram.sendPhoto(partnerId, message.photo[message.photo.length - 1].file_id, {
+        caption: message.caption || undefined
+      });
+    } else if (message.video) {
+      await bot.telegram.sendVideo(partnerId, message.video.file_id, {
+        caption: message.caption || undefined
+      });
+    } else if (message.animation) {
+      await bot.telegram.sendAnimation(partnerId, message.animation.file_id, {
+        caption: message.caption || undefined
+      });
+    } else if (message.audio) {
+      await bot.telegram.sendAudio(partnerId, message.audio.file_id, {
+        caption: message.caption || undefined
+      });
+    } else if (message.voice) {
+      await bot.telegram.sendVoice(partnerId, message.voice.file_id);
+    } else if (message.video_note) {
+      await bot.telegram.sendVideoNote(partnerId, message.video_note.file_id);
+    } else if (message.document) {
+      await bot.telegram.sendDocument(partnerId, message.document.file_id, {
+        caption: message.caption || undefined
+      });
+    } else if (message.sticker) {
+      await bot.telegram.sendSticker(partnerId, message.sticker.file_id);
+    } else if (message.location) {
+      await bot.telegram.sendLocation(partnerId, message.location.latitude, message.location.longitude);
+    } else if (message.contact) {
+      await bot.telegram.sendContact(partnerId, message.contact.phone_number, message.contact.first_name, {
+        last_name: message.contact.last_name || undefined
+      });
+    } else if (message.poll) {
+      const poll = message.poll;
+      await bot.telegram.sendPoll(
+        partnerId,
+        poll.question,
+        poll.options.map(option => option.text),
+        {
+          is_anonymous: poll.is_anonymous,
+          type: poll.type,
+          allows_multiple_answers: poll.allows_multiple_answers
+        }
+      );
+    } else if (message.dice) {
+      await bot.telegram.sendDice(partnerId, {
+        emoji: message.dice.emoji
+      });
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Failed to forward media:', error);
+    return false;
+  }
+};
+
 // Error handling
 bot.catch((err, ctx) => {
   console.error(`Bot error:`, err);
@@ -343,7 +438,7 @@ bot.start((ctx) => {
 
 🔍 Use /find to find a random chat partner
 🛑 Use /end to finish your current conversation
-📝 Messages are forwarded anonymously between partners
+📝 Send text, photos, videos, stickers, and any media anonymously
 
 *Stay respectful and enjoy chatting\\!*`;
 
@@ -427,26 +522,46 @@ bot.hears('🔄 End & Find New', async (ctx) => {
 
 bot.hears('❌ End Chat', endChat);
 
-// Message forwarding
-bot.on('text', async (ctx) => {
+bot.hears('❌ Cancel Search', cancelSearch);
+
+// Handle all media and message types
+bot.on(['text', 'photo', 'video', 'animation', 'audio', 'voice', 'video_note', 'document', 'sticker', 'location', 'contact', 'poll', 'dice'], async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
   if (!userCtx) return;
   
   const userId = userCtx.userObject.id;
   const userData = users.get(userId);
-  const messageText = ctx.message.text;
   
-  // Block commands from being forwarded
-  if (messageText.startsWith('/')) {
-    if (userData && userData.state === 'chatting') {
-      return ctx.replyWithMarkdownV2("❌ *Commands cannot be sent to your chat partner\\.*\n\nIf you want to end the chat, use /end");
+  // Handle text messages specifically
+  if (ctx.message.text) {
+    const messageText = ctx.message.text;
+    
+    // Block commands from being forwarded
+    if (messageText.startsWith('/')) {
+      if (userData && userData.state === 'chatting') {
+        return ctx.replyWithMarkdownV2("❌ *Commands cannot be sent to your chat partner\\.*\n\nIf you want to end the chat, use /end");
+      }
+      return; // Let Telegraf handle the command normally
     }
-    return; // Let Telegraf handle the command normally
-  }
-  
-  // Block reply keyboard button text from being forwarded
-  if (messageText === '🔗 Share Username' || messageText === '🔄 End & Find New' || messageText === '❌ End Chat') {
-    return; // These are handled by the hears handlers above
+    
+    // Block reply keyboard button text from being forwarded
+    if (messageText === '🔗 Share Username' || messageText === '🔄 End & Find New' || messageText === '❌ End Chat' || messageText === '❌ Cancel Search') {
+      return; // These are handled by the hears handlers above
+    }
+    
+    // Message length check for text
+    if (messageText.length > MAX_MESSAGE_LENGTH) {
+      return ctx.replyWithMarkdownV2(`❌ *Message too long\\!*\n\nPlease keep messages under ${MAX_MESSAGE_LENGTH} characters\\.`);
+    }
+    
+    // Content filtering for text
+    const lowerMessage = messageText.toLowerCase();
+    for (const keyword of prohibitedKeywords) {
+      if (lowerMessage.includes(keyword)) {
+        console.warn(`Blocked message from ${userId} containing: ${keyword}`);
+        return ctx.replyWithMarkdownV2("🚫 *Your message was blocked\\.*\n\nPlease keep conversations respectful\\.");
+      }
+    }
   }
   
   if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
@@ -457,20 +572,6 @@ bot.on('text', async (ctx) => {
   }
   
   const partnerId = sessions.get(userId);
-  
-  // Message length check
-  if (messageText.length > MAX_MESSAGE_LENGTH) {
-    return ctx.replyWithMarkdownV2(`❌ *Message too long\\!*\n\nPlease keep messages under ${MAX_MESSAGE_LENGTH} characters\\.`);
-  }
-  
-  // Content filtering
-  const lowerMessage = messageText.toLowerCase();
-  for (const keyword of prohibitedKeywords) {
-    if (lowerMessage.includes(keyword)) {
-      console.warn(`Blocked message from ${userId} containing: ${keyword}`);
-      return ctx.replyWithMarkdownV2("🚫 *Your message was blocked\\.*\n\nPlease keep conversations respectful\\.");
-    }
-  }
   
   // Rate limiting
   const now = Date.now();
@@ -484,20 +585,31 @@ bot.on('text', async (ctx) => {
   recentTimestamps.push(now);
   messageTimestamps.set(userId, recentTimestamps);
   
-  // Forward message
+  // Forward message or media
   try {
-    await bot.telegram.sendMessage(partnerId, messageText);
+    let success = false;
     
-    // Increment message count
-    const sessionId = [userId, partnerId].sort().join('-');
-    const details = sessionDetails.get(sessionId);
-    if (details) {
-      details.messageCount++;
-      sessionDetails.set(sessionId, details);
+    if (ctx.message.text) {
+      // Forward text message
+      await bot.telegram.sendMessage(partnerId, ctx.message.text);
+      success = true;
+    } else {
+      // Forward media
+      success = await forwardMedia(ctx, partnerId);
+    }
+    
+    if (success) {
+      // Increment message count
+      const sessionId = [userId, partnerId].sort().join('-');
+      const details = sessionDetails.get(sessionId);
+      if (details) {
+        details.messageCount++;
+        sessionDetails.set(sessionId, details);
+      }
     }
     
   } catch (error) {
-    console.error(`Message delivery failed from ${userId} to ${partnerId}:`, error);
+    console.error(`Message/media delivery failed from ${userId} to ${partnerId}:`, error);
     
     // End session due to delivery failure
     const sessionId = [userId, partnerId].sort().join('-');
