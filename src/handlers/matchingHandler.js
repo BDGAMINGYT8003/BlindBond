@@ -70,7 +70,7 @@ const createSession = (user1Id, user2Id) => {
       age: user2.age,
       // location: user2.location,
     },
-    // Add message count if needed later
+    messageCount: 0, // Initialize message count
   };
 
   const sessions = loadData(SESSIONS_FILE) || [];
@@ -289,36 +289,107 @@ const handleEndChatCommand = async (ctx, reason = 'user_ended') => {
   const partnerId = (session.user1Id === userId) ? session.user2Id : session.user1Id;
   const partner = User.findById(partnerId);
 
-  // Update both users
-  user.update({ chatState: 'idle', currentSessionId: null });
-  if (partner) {
-    partner.update({ chatState: 'idle', currentSessionId: null });
-  }
-
-  removeSession(sessionId);
-
-  // Notify users
-  let endMessageSelf = "🔚 Your chat has ended.";
-  let endMessagePartner = "🔚 Your chat partner has ended the chat.";
-
-  if (reason === 'partner_disconnected') { // Example of another reason
-    endMessageSelf = "🔚 Your chat partner disconnected. The chat has ended.";
-    endMessagePartner = "🔚 You were disconnected. The chat has ended."; // This might not be sendable if they truly DC'd
-  } else if (reason === 'error') {
-    endMessageSelf = "🔚 Chat ended due to an error.";
-    endMessagePartner = "🔚 Chat ended due to an error.";
-  }
-
-  await ctx.reply(endMessageSelf, removeKeyboard);
-  try {
-    if (partner) { // Check if partner exists, e.g., not deleted account
-      await ctx.telegram.sendMessage(partnerId, endMessagePartner, removeKeyboard);
-    }
-  } catch (error) {
-    console.error(`Error sending end chat message to partner ${partnerId}:`, error);
-  }
+  await _endChatSessionInternal(ctx.telegram, userId, partnerId, sessionId, reason, ctx);
 };
 
+/**
+ * Internal logic to end a chat session, update users, send summaries, and remove session data.
+ * @param {object} telegram - Telegraf telegram object.
+ * @param {number} primaryUserId - The user ID primarily associated with the context ending the chat.
+ * @param {number|null} secondaryUserId - The partner's user ID (can be null if partner data is missing).
+ * @param {string} sessionId - The session ID.
+ * @param {string} reason - Reason for ending the chat.
+ * @param {object|null} ctx - Original Telegraf context, if available, for replying to the primaryUser.
+ */
+async function _endChatSessionInternal(telegram, primaryUserId, secondaryUserId, sessionId, reason, ctx = null) {
+  const session = getSessionById(sessionId); // Fetch session details for summary, even if one user is gone
+
+  // Send summary if session data is available
+  if (session) {
+    // Determine actual user IDs from session to ensure correct summary recipients
+    const user1 = session.user1Id;
+    const user2 = session.user2Id;
+    await sendConversationSummary(telegram, user1, user2, sessionId, reason);
+  } else {
+    console.warn(`Session ${sessionId} not found when trying to end chat internally for user ${primaryUserId}. Cannot send summary.`);
+  }
+
+  // Update primary user
+  const primaryUser = User.findById(primaryUserId);
+  if (primaryUser) {
+    primaryUser.update({ chatState: 'idle', currentSessionId: null });
+  }
+
+  // Update secondary user (partner)
+  if (secondaryUserId) {
+    const secondaryUser = User.findById(secondaryUserId);
+    if (secondaryUser) {
+      secondaryUser.update({ chatState: 'idle', currentSessionId: null });
+    }
+  }
+
+  removeSession(sessionId); // Remove session from storage
+
+  // Notify the primary user (who initiated the command or experienced the error)
+  if (ctx && reason !== 'report_ended' && reason !== 'partner_disconnected_or_blocked' && reason !== 'error') {
+    // Avoid sending this if a more specific message is handled by the calling context or error handler
+    await ctx.reply("Chat ended. A summary has been provided.", removeKeyboard);
+  } else if (ctx && reason === 'error') {
+     await ctx.reply("Chat ended due to an error. A summary has been provided if possible.", removeKeyboard);
+  }
+  // For 'report_ended' and 'partner_disconnected_or_blocked', specific messages are sent by their respective handlers.
+  // Partner is notified by the summary directly.
+}
+
+
+/**
+ * Sends a conversation summary to both users involved in a session.
+ * @param {object} telegram - Telegraf telegram object (bot.telegram).
+ * @param {number} userId1 - ID of the first user.
+ * @param {number|null} userId2 - ID of the second user (can be null if partner doesn't exist).
+ * @param {string} sessionId - The ID of the session.
+ * @param {string} [reason='ended'] - The reason the chat ended.
+ */
+const sendConversationSummary = async (telegram, userId1, userId2, sessionId, reason = 'ended') => {
+  const session = getSessionById(sessionId);
+  if (!session) {
+    console.error(`sendConversationSummary: Session ${sessionId} not found.`);
+    return;
+  }
+
+  const { formatDuration, escapeMarkdown } = require('../utils/helpers');
+
+  const durationMs = Date.now() - new Date(session.startTime).getTime();
+  const formattedDuration = formatDuration(durationMs);
+  const messageCount = session.messageCount || 0;
+
+  let summaryMessageText = `🔚 The conversation has officially concluded.\n\n`;
+  summaryMessageText += `⏱️ Duration: ${escapeMarkdown(formattedDuration)}\n`;
+  summaryMessageText += `💬 Total messages exchanged: ${messageCount}`;
+
+  const finalMessageOptions = {
+    parse_mode: 'MarkdownV2',
+    reply_markup: removeKeyboard  // removeKeyboard is imported from constants
+  };
+
+  try {
+    if (User.findById(userId1)) { // Check if user1 still exists
+      await telegram.sendMessage(userId1, summaryMessageText, finalMessageOptions);
+    }
+  } catch (error) {
+    console.error(`Failed to send summary to user ${userId1}:`, error);
+  }
+
+  if (userId2) { // Only send to userId2 if they exist
+    try {
+      if (User.findById(userId2)) { // Check if user2 still exists
+       await telegram.sendMessage(userId2, summaryMessageText, finalMessageOptions);
+      }
+    } catch (error) {
+      console.error(`Failed to send summary to user ${userId2}:`, error);
+    }
+  }
+};
 
 module.exports = {
   handleFindCommand,
@@ -406,4 +477,6 @@ module.exports = {
   User, // User model itself is also exported, useful for type hinting or direct use in bot.js
   initializeMatchingState,
   tryMatchUsers,
+  sendConversationSummary,
+  _endChatSessionInternal, // Export for use in other handlers if necessary (e.g. bot.js error handling)
 };

@@ -51,4 +51,9 @@ module.exports = {
   MAX_AGE: 99,
   GENDER_OPTIONS: ['Male', 'Female'],
   INTEREST_OPTIONS: ['Male', 'Female', 'Both'],
+  // Share Username confirmation keyboard
+  SHARE_USERNAME_CONFIRM_KEYBOARD: Markup.inlineKeyboard([
+    Markup.button.callback('✅ Yes, Share', 'share_username_yes'),
+    Markup.button.callback('❌ No, Don\'t Share', 'share_username_no')
+  ]),
 };

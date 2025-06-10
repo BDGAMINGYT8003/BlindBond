@@ -73,16 +73,23 @@ const handleReportYes = async (ctx) => {
   // We need a context object for handleEndChatCommand.
   // We can either construct a minimal one or adapt handleEndChatCommand.
   // For now, let's assume handleEndChatCommand primarily uses ctx.from.id and can be called with a modified ctx.
-  // Or, more cleanly, extract the core session cleanup logic from handleEndChatCommand.
+  // Or, more cleanly, extract the core session cleanup logic from handleEndChatCommand. (This has been done with _endChatSessionInternal)
 
-  // Simplified end chat logic directly here for now, ensure both users are reset
-  const { User: MUser, removeSession: MRemoveSession } = require('./matchingHandler'); // Re-import to avoid circular if matchingHandler imports this file
+  const { _endChatSessionInternal } = require('./matchingHandler');
+  await _endChatSessionInternal(ctx.telegram, reporterId, reportedId, session.sessionId, 'report_ended');
+  // The _endChatSessionInternal will handle sending summaries, updating user states, and removing the session.
+  // The ctx.editMessageText for the reporter is done above.
+  // The notification to the reported user about chat ending due to report should be handled carefully.
+  // _endChatSessionInternal sends a generic summary. We've added a specific "ended by system following report" message before calling it.
 
-  MUser.findById(reporterId)?.update({ chatState: 'idle', currentSessionId: null });
-  MUser.findById(reportedId)?.update({ chatState: 'idle', currentSessionId: null });
-  MRemoveSession(session.sessionId);
-
-  console.log(`Chat session ${session.sessionId} ended due to report by ${reporterId} against ${reportedId}`);
+  // Inform the reported user (This is now done BEFORE calling _endChatSessionInternal for clarity, as summary is generic)
+  // try {
+  //   await ctx.telegram.sendMessage(reportedId, "This chat has been ended by the system following a report.");
+  // } catch (error) {
+  //   console.error(`Failed to send 'chat ended by system' message to reported user ${reportedId}:`, error);
+  // }
+  // The previous direct user state updates and session removal are now handled by _endChatSessionInternal.
+  console.log(`Chat session ${session.sessionId} processing for end due to report by ${reporterId} against ${reportedId} delegated to _endChatSessionInternal.`);
 
   // Check for automatic warning message to reported user
   // Consider making the upper bound for this specific message also a constant if needed elsewhere
@@ -105,7 +112,78 @@ const handleReportNo = async (ctx) => {
   await ctx.editMessageText("Report cancelled. You can continue chatting.", { reply_markup: null });
 };
 
+const { getSessionById: getSessionFromMatchingHandler } = require('./matchingHandler'); // Alias to avoid conflict if getSessionById is also defined here
+
+/**
+ * Handles the 'Yes, Share Username' action.
+ * Shares the user's username with their chat partner.
+ * @param {object} ctx - Telegraf context object.
+ */
+const handleShareUsernameYes = async (ctx) => {
+  const userId = ctx.from.id;
+  const user = User.findById(userId);
+  const username = ctx.from.username; // Username of the user who clicked the button
+
+  if (!user || user.chatState !== 'chatting' || !user.currentSessionId) {
+    await ctx.answerCbQuery("Error: Not in an active chat.");
+    return ctx.editMessageText("Could not share username: You are no longer in an active chat.");
+  }
+
+  if (!username) {
+    await ctx.answerCbQuery("No username set.");
+    return ctx.editMessageText("You don't have a username set in your Telegram profile. Please set one in Telegram settings and try again.");
+  }
+
+  const session = getSessionFromMatchingHandler(user.currentSessionId);
+  if (!session) {
+    await ctx.answerCbQuery("Error: Session not found.");
+    // It's possible the session ended right as they clicked.
+    user.update({ chatState: 'idle', currentSessionId: null }); // Clean up user state
+    return ctx.editMessageText("Could not share username: Active session not found. Your chat status has been reset.");
+  }
+
+  const partnerId = (session.user1Id === userId) ? session.user2Id : session.user1Id;
+  const partnerUser = User.findById(partnerId); // Check if partner still exists
+
+  if (!partnerUser) {
+    await ctx.answerCbQuery("Error: Partner not found.");
+    return ctx.editMessageText("Could not share username: Your chat partner could not be found.");
+  }
+
+  try {
+    await ctx.telegram.sendMessage(partnerId, `Your chat partner (${user.firstName || 'User'}) has shared their username: @${username}`);
+    await ctx.editMessageText(`Your username @${username} has been shared with your partner.`);
+    await ctx.answerCbQuery("Username shared!");
+  } catch (error) {
+    console.error(`Failed to send username from ${userId} to partner ${partnerId}:`, error);
+    let errorMessage = "Could not share username with partner. ";
+    if (error.code === 403) { // Forbidden: bot was blocked by the user
+        errorMessage += "They may have blocked the bot.";
+         // Optionally, end the chat here if desired, as communication is one-way now.
+         // const { _endChatSessionInternal } = require('./matchingHandler');
+         // await _endChatSessionInternal(ctx.telegram, userId, partnerId, user.currentSessionId, 'partner_blocked_bot_on_share');
+    } else {
+        errorMessage += "An unexpected error occurred.";
+    }
+    await ctx.editMessageText(errorMessage);
+    await ctx.answerCbQuery("Failed to send.");
+  }
+};
+
+/**
+ * Handles the 'No, Don't Share Username' action.
+ * Cancels the username sharing process.
+ * @param {object} ctx - Telegraf context object.
+ */
+const handleShareUsernameNo = async (ctx) => {
+  await ctx.answerCbQuery("Username not shared.");
+  await ctx.editMessageText("Okay, your username was not shared.");
+};
+
+
 module.exports = {
   handleReportYes,
   handleReportNo,
+  handleShareUsernameYes,
+  handleShareUsernameNo,
 };

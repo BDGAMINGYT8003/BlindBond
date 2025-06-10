@@ -80,9 +80,16 @@ const {
   handleCancelSearchCommand,
   handleEndChatCommand,
   getSessionById: match_getSessionById,
+  _endChatSessionInternal: match_endChatInternal, // Import for direct use
+  _endChatSessionInternal: match_endChatInternal, // Import for direct use
 } = require('./src/handlers/matchingHandler');
 const { handleReportCommand } = require('./src/handlers/commandHandler');
-const { handleReportYes, handleReportNo } = require('./src/handlers/actionHandler');
+const {
+  handleReportYes,
+  handleReportNo,
+  handleShareUsernameYes,
+  handleShareUsernameNo
+} = require('./src/handlers/actionHandler');
 
 
 // Command handlers
@@ -114,32 +121,35 @@ bot.command('report', handleReportCommand);
 // Action handlers for inline keyboards
 bot.action('report_yes', handleReportYes);
 bot.action('report_no', handleReportNo);
+bot.action('share_username_yes', handleShareUsernameYes);
+bot.action('share_username_no', handleShareUsernameNo);
 
 
 // Text-based triggers from keyboards
 // Update options
 bot.hears('Update Gender', async (ctx) => {
     const user = User.findById(ctx.from.id);
-    if (user && user.isOnboarded() && !user.chatState) await startGenderUpdate(ctx); // Ensure not in chat/waiting
-    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
-    else if (!user) await handleStartCommand(ctx);
-    // If in chat/waiting, could ignore or send specific message. For now, prioritize chat/wait state.
+    if (user && user.isOnboarded() && user.chatState === 'idle') await startGenderUpdate(ctx);
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx); // Guide to onboarding
+    else if (!user) await handleStartCommand(ctx); // New user
+    // If user is 'chatting' or 'waiting', this .hears won't trigger startGenderUpdate.
+    // The text "Update Gender" would then be processed by the main message handler.
 });
 bot.hears('Update Age', async (ctx) => {
     const user = User.findById(ctx.from.id);
-    if (user && user.isOnboarded() && !user.chatState) await startAgeUpdate(ctx);
+    if (user && user.isOnboarded() && user.chatState === 'idle') await startAgeUpdate(ctx);
     else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
     else if (!user) await handleStartCommand(ctx);
 });
 bot.hears('Update Location', async (ctx) => {
     const user = User.findById(ctx.from.id);
-    if (user && user.isOnboarded() && !user.chatState) await startLocationUpdate(ctx);
+    if (user && user.isOnboarded() && user.chatState === 'idle') await startLocationUpdate(ctx);
     else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
     else if (!user) await handleStartCommand(ctx);
 });
 bot.hears('Update Interest', async (ctx) => {
     const user = User.findById(ctx.from.id);
-    if (user && user.isOnboarded() && !user.chatState) await startInterestUpdate(ctx);
+    if (user && user.isOnboarded() && user.chatState === 'idle') await startInterestUpdate(ctx);
     else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
     else if (!user) await handleStartCommand(ctx);
 });
@@ -158,7 +168,18 @@ bot.hears('🔄 End & Find New', async (ctx) => {
   await handleEndChatCommand(ctx); // End current chat
   await match_handleFindCommand(ctx); // Start finding new one
 });
-// Share Username is more complex, will handle with active chat logic.
+// Share Username is more complex, will handle with active chat logic. (This comment can be removed now)
+const { SHARE_USERNAME_CONFIRM_KEYBOARD } = require('./src/utils/constants');
+
+bot.hears('🔗 Share Username', async (ctx) => {
+  const user = User.findById(ctx.from.id); // User model should be available
+  if (!user || user.chatState !== 'chatting' || !user.currentSessionId) {
+    // This message might be sent if the keyboard is somehow available when not in chat.
+    // Or if the user clicks it after a chat has already ended by other means.
+    return ctx.reply("You can only share your username when you are in an active chat.", removeKeyboard); // removeKeyboard from constants
+  }
+  await ctx.reply("Would you like to share your Telegram username with your chat partner? They will be able to contact you directly.", SHARE_USERNAME_CONFIRM_KEYBOARD);
+});
 
 // General message handler for text, location, and other applicable types
 bot.on(['text', 'location', 'photo', 'video', 'voice', 'sticker', 'document', 'animation'], async (ctx) => {
@@ -205,6 +226,21 @@ bot.on(['text', 'location', 'photo', 'video', 'voice', 'sticker', 'document', 'a
       if (session) {
         const partnerId = (session.user1Id === userId) ? session.user2Id : session.user1Id;
         if (partnerId) {
+          // --- Rate Limiting Logic Start ---
+          const now = Date.now();
+          const user_timestamps = messageTimestamps.get(userId) || []; // Use a different variable name to avoid conflict with global messageTimestamps
+
+          const recent_timestamps = user_timestamps.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW);
+
+          if (recent_timestamps.length >= MAX_MESSAGES_IN_WINDOW) {
+            await ctx.reply("⚠️ Slow down! You're sending messages too quickly.");
+            return; // Stop processing this message
+          }
+
+          recent_timestamps.push(now);
+          messageTimestamps.set(userId, recent_timestamps);
+          // --- Rate Limiting Logic End ---
+
           try {
             let chatAction = 'typing'; // Default action
 
@@ -270,28 +306,43 @@ bot.on(['text', 'location', 'photo', 'video', 'voice', 'sticker', 'document', 'a
                await ctx.telegram.sendLocation(partnerId, ctx.message.location.latitude, ctx.message.location.longitude);
             } else if (ctx.message.video_note) {
                await ctx.telegram.sendVideoNote(partnerId, ctx.message.video_note.file_id);
-            }
-            else {
+            } else {
               console.log("Attempted to forward unhandled message type:", ctx.message);
               ctx.reply("This message type cannot be forwarded.");
+              return; // Don't increment message count for unhandled types
             }
+
+            // Increment message count if forwarding was successful
+            if (session) { // Ensure session object is available
+              session.messageCount = (session.messageCount || 0) + 1;
+              const sessions = match_loadData_sessions(); // Need a way to load/save sessions here
+              const sessionIndex = sessions.findIndex(s => s.sessionId === session.sessionId);
+              if (sessionIndex > -1) {
+                sessions[sessionIndex] = session;
+                match_saveData_sessions(sessions); // Need a way to save sessions here
+              }
+            }
+
           } catch (error) {
             console.error(`Failed to forward message from ${userId} to ${partnerId}:`, error);
-            // Check if partner blocked the bot or other issues
             if (error.code === 403) { // Forbidden: bot was blocked by the user
                 ctx.reply("Your partner may have disconnected or blocked the bot. Ending chat.");
-                await handleEndChatCommand(ctx, 'partner_disconnected_or_blocked');
+                // Use _endChatSessionInternal directly
+                await match_endChatInternal(ctx.telegram, userId, partnerId, user.currentSessionId, 'partner_disconnected_or_blocked', ctx);
             } else {
-                ctx.reply("Could not send your message. Please try again.");
+                // For other errors, we might not want to end the chat immediately,
+                // but inform the sender that the message failed.
+                ctx.reply("Could not send your message due to an unexpected error. Please try again.");
             }
           }
-          return; // Message handled by forwarding
+          return; // Message handled (or attempted) by forwarding
         }
       } else {
         // Session ID exists on user but not in sessions.json (data inconsistency)
-        console.error(`User ${userId} in chatting state but session ${user.currentSessionId} not found.`);
-        user.update({ chatState: 'idle', currentSessionId: null });
-        ctx.reply("There was an issue with your chat session. It has been ended. Please use /find to start a new one.", Markup.removeKeyboard());
+        console.error(`User ${userId} in chatting state but session ${user.currentSessionId} not found. Cleaning up user state.`);
+        // Use _endChatSessionInternal for cleanup. PartnerId is unknown.
+        // The user will be informed by _endChatSessionInternal if ctx is passed and reason is 'error'.
+        await match_endChatInternal(ctx.telegram, userId, null, user.currentSessionId, 'error_session_not_found', ctx);
         return;
       }
     }
