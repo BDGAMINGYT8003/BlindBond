@@ -1,5 +1,39 @@
 
 const { Telegraf, Markup } = require('telegraf');
+const fs = require('fs');
+const path = require('path');
+
+// User data persistence
+const userDataPath = path.join(__dirname, 'users_data.json');
+let users = new Map(); // Now global, will be populated by loadUsers
+
+function loadUsers() {
+  try {
+    if (fs.existsSync(userDataPath)) {
+      const data = fs.readFileSync(userDataPath, 'utf8');
+      const parsedData = JSON.parse(data);
+      // Ensure keys are numbers as Telegraf uses numeric IDs.
+      // Map constructor from an array of [key, value] entries.
+      users = new Map(parsedData.map(([key, value]) => [Number(key), value]));
+      console.log('User data loaded successfully.');
+    } else {
+      console.log('No user data file found. Starting with an empty user set.');
+    }
+  } catch (error) {
+    console.error('Failed to load user data:', error);
+    users = new Map(); // Start with an empty map in case of error
+  }
+}
+
+async function saveUsers() {
+  try {
+    const dataToSave = JSON.stringify(Array.from(users.entries()));
+    fs.writeFileSync(userDataPath, dataToSave, 'utf8');
+    console.log('User data saved successfully.');
+  } catch (error) {
+    console.error('Failed to save user data:', error);
+  }
+}
 
 // Bot token - replace with environment variable in production
 const BOT_TOKEN = '7947606721:AAGxfrYl1HI86IRkYKbIyhwkmq4cu2Pb-vo';
@@ -7,8 +41,7 @@ const BOT_TOKEN = '7947606721:AAGxfrYl1HI86IRkYKbIyhwkmq4cu2Pb-vo';
 // Initialize the bot
 const bot = new Telegraf(BOT_TOKEN);
 
-// Data structures
-const users = new Map(); // userId -> { state: 'idle'/'waiting'/'chatting', userObject: ctx.from }
+// Data structures (users Map is now global and loaded by loadUsers)
 const waitingQueue = []; // Array of user IDs waiting for partners
 const sessions = new Map(); // userId -> partnerId
 const sessionDetails = new Map(); // sessionId -> { startTime, messageCount, user1Id, user2Id }
@@ -130,18 +163,123 @@ const shareConfirmKeyboard = Markup.inlineKeyboard([
 
 const removeKeyboard = Markup.removeKeyboard();
 
+// Onboarding keyboards
+const genderReplyKeyboard = Markup.keyboard([['Male', 'Female']]).resize().oneTime();
+const requestLocationKeyboard = Markup.keyboard([
+  [Markup.button.locationRequest('Share My Location')]
+]).resize().oneTime();
+const interestedInKeyboard = Markup.keyboard([
+  ['Male', 'Female'],
+  ['Both']
+]).resize().oneTime();
+
+// Profile Update Keyboard
+const updateProfileKeyboard = Markup.keyboard([
+  ['Update Gender', 'Update Age'],
+  ['Update Location', 'Update Interest'],
+  ['Back to Main Menu']
+]).resize().oneTime();
+
+// Onboarding helper functions
+const handleOnboarding = async (ctx) => {
+  const userData = users.get(ctx.from.id);
+  if (!userData) return; // Should not happen if ensureUserInitialized is called
+
+  switch (userData.onboardingState) {
+    case 'pending_gender':
+      await ctx.reply("Please select your gender:", { reply_markup: genderReplyKeyboard.reply_markup });
+      break;
+    case 'pending_age':
+      await ctx.reply("Please enter your age (e.g., 25).", { reply_markup: removeKeyboard.reply_markup });
+      break;
+    case 'pending_location':
+      await ctx.reply(
+        "Please share your location. This helps in finding relevant matches but will be kept approximate for your privacy.",
+        { reply_markup: requestLocationKeyboard.reply_markup }
+      );
+      break;
+    case 'pending_interested_in':
+      await ctx.reply(
+        "Please select who you are interested in meeting:",
+        { reply_markup: interestedInKeyboard.reply_markup }
+      );
+      break;
+    case 'completed':
+      // This case is now primarily handled by maybeStartOnboarding after onboarding completion.
+      // If handleOnboarding is called directly with 'completed' state, show the main welcome message.
+      await ctx.replyWithMarkdownV2(
+        `🤖 *Welcome to Anonymous Chat Bot\\!*
+
+Your setup is complete\\.
+🔍 Use /find to find a random chat partner
+🛑 Use /end to finish your current conversation
+📝 Send text, photos, videos, stickers, and any media anonymously
+
+*Stay respectful and enjoy chatting\\!*`,
+        { reply_markup: removeKeyboard.reply_markup }
+      );
+      break;
+    default:
+      console.error(`Unknown onboarding state: ${userData.onboardingState} for user ${ctx.from.id}`);
+      await ctx.reply("An unexpected error occurred during onboarding. Please try /start again.");
+      // Reset to a known state if necessary
+      userData.onboardingState = 'pending_gender';
+      users.set(ctx.from.id, userData);
+      break;
+  }
+};
+
+const maybeStartOnboarding = async (ctx) => {
+  const userData = users.get(ctx.from.id); // User should be initialized by now
+  if (!userData) {
+    console.error("User not found in maybeStartOnboarding, this shouldn't happen.");
+    return ctx.reply("An error occurred. Please try again.");
+  }
+
+  if (userData.onboardingState !== 'completed') {
+    await handleOnboarding(ctx);
+  } else {
+    // Standard welcome message if onboarding is complete
+    await ctx.replyWithMarkdownV2(
+      `🤖 *Welcome back to Anonymous Chat Bot\\!*
+
+🔍 Use /find to find a random chat partner
+🛑 Use /end to finish your current conversation
+
+*Stay respectful and enjoy chatting\\!*`,
+      { reply_markup: removeKeyboard.reply_markup }
+    );
+  }
+};
+
 // Initialize user helper
 const ensureUserInitialized = (ctx) => {
   if (!ctx.from) return null;
   
   const userId = ctx.from.id;
   if (!users.has(userId)) {
-    users.set(userId, { state: 'idle', userObject: ctx.from });
+    users.set(userId, {
+      state: 'idle',
+      userObject: ctx.from,
+      gender: null,
+      age: null,
+      location: null,
+      interestedIn: null,
+      onboardingState: 'pending_gender',
+      profileUpdateState: null // Initialize new state
+    });
     console.log(`User ${userId} (${ctx.from.username || 'no_username'}) initialized`);
   } else {
     // Update user object if changed
     const existingUser = users.get(userId);
     existingUser.userObject = ctx.from;
+    // Ensure new fields exist for older users, if not already present
+    if (existingUser.gender === undefined) existingUser.gender = null;
+    if (existingUser.age === undefined) existingUser.age = null;
+    if (existingUser.location === undefined) existingUser.location = null;
+    if (existingUser.interestedIn === undefined) existingUser.interestedIn = null;
+    if (existingUser.onboardingState === undefined) existingUser.onboardingState = 'pending_gender';
+    if (existingUser.profileUpdateState === undefined) existingUser.profileUpdateState = null; // Ensure for existing users
     users.set(userId, existingUser);
   }
   
@@ -219,6 +357,8 @@ const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') =>
     user2Data.state = 'idle';
     users.set(partnerId, user2Data);
   }
+  // After users are set to idle, try to match anyone remaining in the queue
+  await tryMatchUsers();
 };
 
 // Cancel search function
@@ -248,6 +388,124 @@ const cancelSearch = async (ctx) => {
   await ctx.replyWithMarkdownV2("✅ *Search cancelled\\.*\n\nYou can use /find to search for a partner again\\.", { reply_markup: removeKeyboard.reply_markup });
 };
 
+// Matching Logic
+const isCompatible = (userA, userB) => {
+  if (!userA || !userB) return false;
+
+  const aLikesB = userA.interestedIn === userB.gender || userA.interestedIn === 'both';
+  const bLikesA = userB.interestedIn === userA.gender || userB.interestedIn === 'both';
+
+  return aLikesB && bLikesA;
+};
+
+// Helper function to format partner information for connection messages
+const formatPartnerInfo = (partnerData) => {
+  if (!partnerData) {
+    return "Unfortunately, there was an issue retrieving your match's details.";
+  }
+
+  const displayGender = partnerData.gender
+    ? escapeMarkdown(partnerData.gender.charAt(0).toUpperCase() + partnerData.gender.slice(1))
+    : 'Not specified';
+  const displayAge = partnerData.age ? escapeMarkdown(String(partnerData.age)) : 'Not specified';
+  const displayLocation = partnerData.location ? 'Shared' : 'Not shared';
+
+  return `\n*Partner's Profile:*
+\\- Gender: ${displayGender}
+\\- Age: ${displayAge}
+\\- Location: ${displayLocation}`;
+};
+
+async function tryMatchUsers() {
+  if (waitingQueue.length < 2) {
+    return; // Not enough users to match
+  }
+
+  console.log(`Attempting to match users. Queue size: ${waitingQueue.length}`);
+  let i = 0;
+  while (i < waitingQueue.length) {
+    let matched = false;
+    for (let j = i + 1; j < waitingQueue.length; j++) {
+      const userId1 = waitingQueue[i];
+      const userId2 = waitingQueue[j];
+
+      const user1Data = users.get(userId1);
+      const user2Data = users.get(userId2);
+
+      if (!user1Data || !user2Data) {
+        console.error(`User data missing for ${userId1} or ${userId2} during matching. Removing from queue.`);
+        // Remove problematic users (or just the one whose data is missing)
+        // This is a safeguard; ideally, user data should always be present if they are in the queue.
+        if (!user1Data) waitingQueue.splice(i, 1); else if (i < j) waitingQueue.splice(j, 1); else waitingQueue.splice(i, 1);
+        if (!user2Data && waitingQueue.includes(userId2)) { // if user2 was not user1 and still in queue
+            const idx = waitingQueue.indexOf(userId2);
+            if(idx > -1) waitingQueue.splice(idx, 1);
+        }
+        i--; // Adjust outer loop index due to removal
+        matched = true; // Restart outer loop essentially
+        break;
+      }
+
+      if (user1Data.onboardingState !== 'completed' || user2Data.onboardingState !== 'completed') {
+        continue; // Skip users who haven't completed onboarding (shouldn't be in queue ideally, but as a safeguard)
+      }
+
+      if (isCompatible(user1Data, user2Data)) {
+        console.log(`Match found: ${userId1} and ${userId2}`);
+        // Remove both users from waiting queue
+        // Order of removal matters to keep indices correct for splice
+        waitingQueue.splice(j, 1); // Remove user j first (higher index)
+        waitingQueue.splice(i, 1); // Remove user i
+
+        // Create session
+        sessions.set(userId1, userId2);
+        sessions.set(userId2, userId1);
+
+        user1Data.state = 'chatting';
+        user2Data.state = 'chatting';
+        users.set(userId1, user1Data);
+        users.set(userId2, user2Data);
+
+        const sessionId = [userId1, userId2].sort().join('-');
+        sessionDetails.set(sessionId, {
+          startTime: new Date(),
+          messageCount: 0,
+          user1Id,
+          user2Id
+        });
+        usernameShareData.set(sessionId, { user1Shares: 0, user2Shares: 0 });
+
+        console.log(`Session started: ${sessionId}`);
+
+        // Prepare personalized connection messages
+        const partnerInfoForUser1 = formatPartnerInfo(user2Data);
+        const partnerInfoForUser2 = formatPartnerInfo(user1Data);
+
+        const baseConnectMessage = `\n\n💬 Start chatting by sending messages, photos, videos, stickers, or any media\\.
+🔗 Use the button below to share your username if you want\\.`;
+
+        const connectMessageUser1 = `🎉 *You're now connected with a stranger\\!*${partnerInfoForUser1}${baseConnectMessage}`;
+        const connectMessageUser2 = `🎉 *You're now connected with a stranger\\!*${partnerInfoForUser2}${baseConnectMessage}`;
+
+        try {
+          await bot.telegram.sendMessage(userId1, connectMessageUser1, { parse_mode: 'MarkdownV2', reply_markup: chatActiveKeyboard.reply_markup });
+          await bot.telegram.sendMessage(userId2, connectMessageUser2, { parse_mode: 'MarkdownV2', reply_markup: chatActiveKeyboard.reply_markup });
+        } catch (error) {
+          console.error('Failed to send connection messages:', error);
+        }
+
+        matched = true;
+        i--; // Adjust outer loop index because an element was removed before current i
+        break; // Break inner loop and restart scan for user i (now potentially a new user if i was removed) or next user
+      }
+    }
+    if (!matched) {
+      i++; // Move to the next user in the outer loop only if no match was made for the current user i
+    }
+  }
+}
+
+
 // Find partner function (extracted for reuse)
 const findPartner = async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
@@ -270,74 +528,15 @@ const findPartner = async (ctx) => {
   
   // Add to waiting queue
   userCtx.state = 'waiting';
-  users.set(userId, userCtx);
-  waitingQueue.push(userId);
-  
-  console.log(`User ${userId} entered waiting queue`);
-  
-  // Try to pair users
-  if (waitingQueue.length >= 2) {
-    const user1Id = waitingQueue.shift();
-    const user2Id = waitingQueue.shift();
-    
-    const user1Data = users.get(user1Id);
-    const user2Data = users.get(user2Id);
-    
-    if (!user1Data || !user2Data) {
-      console.error('User data missing during pairing');
-      return;
-    }
-    
-    // Create session
-    sessions.set(user1Id, user2Id);
-    sessions.set(user2Id, user1Id);
-    
-    // Update states
-    user1Data.state = 'chatting';
-    user2Data.state = 'chatting';
-    users.set(user1Id, user1Data);
-    users.set(user2Id, user2Data);
-    
-    // Create session details
-    const sessionId = [user1Id, user2Id].sort().join('-');
-    sessionDetails.set(sessionId, {
-      startTime: new Date(),
-      messageCount: 0,
-      user1Id,
-      user2Id
-    });
-    
-    // Initialize username share data
-    usernameShareData.set(sessionId, {
-      user1Shares: 0,
-      user2Shares: 0
-    });
-    
-    console.log(`Session started: ${sessionId}`);
-    
-    // Small delay to ensure proper message ordering
-    setTimeout(async () => {
-      // Notify both users with reply keyboard
-      const connectMessage = `🎉 *You're now connected with a stranger\\!*
-
-💬 Start chatting by sending messages, photos, videos, stickers, or any media\\.
-🔗 Use the button below to share your username if you want\\.`;
-      
-      try {
-        await bot.telegram.sendMessage(user1Id, connectMessage, {
-          parse_mode: 'MarkdownV2',
-          reply_markup: chatActiveKeyboard.reply_markup
-        });
-        
-        await bot.telegram.sendMessage(user2Id, connectMessage, {
-          parse_mode: 'MarkdownV2',
-          reply_markup: chatActiveKeyboard.reply_markup
-        });
-      } catch (error) {
-        console.error('Failed to send connection messages:', error);
-      }
-    }, 500); // 500ms delay to ensure proper ordering
+  users.set(userId, userCtx); // Ensure user data is updated with 'waiting' state
+  if (!waitingQueue.includes(userId)) { // Add only if not already there
+      waitingQueue.push(userId);
   }
+  
+  console.log(`User ${userId} (${userCtx.userObject.username || 'no_username'}) entered waiting queue. Queue size: ${waitingQueue.length}`);
+  
+  // Attempt to match users
+  await tryMatchUsers();
 };
 
 // End chat function (extracted for reuse)
@@ -431,25 +630,41 @@ bot.catch((err, ctx) => {
 });
 
 // Start command
-bot.start((ctx) => {
+bot.start(async (ctx) => {
   ensureUserInitialized(ctx);
-  
-  const welcomeMessage = `🤖 *Welcome to Anonymous Chat Bot\\!*
-
-🔍 Use /find to find a random chat partner
-🛑 Use /end to finish your current conversation
-📝 Send text, photos, videos, stickers, and any media anonymously
-
-*Stay respectful and enjoy chatting\\!*`;
-
-  ctx.replyWithMarkdownV2(welcomeMessage, { reply_markup: removeKeyboard.reply_markup });
+  await maybeStartOnboarding(ctx);
 });
 
 // Find chat command (renamed from /new)
-bot.command('find', findPartner);
+bot.command('find', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+
+  if (userCtx.onboardingState !== 'completed') {
+    return ctx.replyWithMarkdownV2("👋 Please complete the onboarding process first to ensure better matching\\. Use /start to begin or continue onboarding\\.", { reply_markup: removeKeyboard.reply_markup });
+  }
+  // Existing findPartner logic
+  await findPartner(ctx);
+});
 
 // End chat command
 bot.command('end', endChat);
+
+// Update profile command
+bot.command('update_profile', async (ctx) => {
+  const userData = ensureUserInitialized(ctx);
+  if (!userData) return;
+
+  if (userData.onboardingState !== 'completed') {
+    return ctx.replyWithMarkdownV2("Please complete the onboarding process first before updating your profile. Use /start to begin or continue onboarding.", { reply_markup: removeKeyboard.reply_markup });
+  }
+
+  userData.state = 'updating_profile'; // General state indicating user is in profile update mode
+  userData.profileUpdateState = 'selecting_option'; // Specific state for choosing what to update
+  users.set(ctx.from.id, userData);
+
+  await ctx.reply("What would you like to update?", { reply_markup: updateProfileKeyboard.reply_markup });
+});
 
 // Handle reply keyboard buttons
 bot.hears('🔗 Share Username', async (ctx) => {
@@ -524,6 +739,176 @@ bot.hears('❌ End Chat', endChat);
 
 bot.hears('❌ Cancel Search', cancelSearch);
 
+// Handle Gender Input for Onboarding
+// Handles 'Male', 'Female', 'Both' for gender and interestedIn onboarding steps
+bot.hears(['Male', 'Female', 'Both'], async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+  const messageText = ctx.message.text;
+
+  if (userData && userData.onboardingState === 'pending_gender') {
+    if (messageText === 'Both') {
+      await ctx.reply("Invalid selection for gender. Please choose Male or Female.", { reply_markup: genderReplyKeyboard.reply_markup });
+      return;
+    }
+    userData.gender = messageText.toLowerCase();
+    userData.onboardingState = 'pending_age';
+    users.set(userId, userData);
+    await ctx.reply(`Gender set to: ${messageText}.`, { reply_markup: removeKeyboard.reply_markup });
+    await handleOnboarding(ctx);
+  } else if (userData && userData.onboardingState === 'pending_interested_in') {
+    userData.interestedIn = messageText.toLowerCase();
+    userData.onboardingState = 'completed';
+    users.set(userId, userData);
+    await saveUsers(); // PERSISTENCE
+    await ctx.reply(`Interest set to: ${messageText}. Onboarding complete!`, { reply_markup: removeKeyboard.reply_markup });
+    await maybeStartOnboarding(ctx);
+  } else if (userData && userData.profileUpdateState === 'pending_new_gender') {
+    if (messageText === 'Both') {
+      await ctx.reply("Invalid selection for gender. Please choose Male or Female.", { reply_markup: genderReplyKeyboard.reply_markup });
+      return;
+    }
+    userData.gender = messageText.toLowerCase();
+    users.set(userId, userData);
+    await saveUsers(); // PERSISTENCE
+    userData.profileUpdateState = 'selecting_option';
+    await ctx.reply(`Gender updated to: ${messageText}.`, { reply_markup: updateProfileKeyboard.reply_markup });
+  } else if (userData && userData.profileUpdateState === 'pending_new_interest') {
+    userData.interestedIn = messageText.toLowerCase();
+    users.set(userId, userData);
+    await saveUsers(); // PERSISTENCE
+    userData.profileUpdateState = 'selecting_option';
+    await ctx.reply(`Interest updated to: ${messageText}.`, { reply_markup: updateProfileKeyboard.reply_markup });
+  } else {
+    // If the message is 'Male', 'Female', or 'Both' but not in a relevant onboarding or update state,
+    // it might be a regular chat message. Let it fall through to the main message handler.
+    if (userData && userData.state !== 'chatting' && userData.state !== 'updating_profile') {
+        // This condition means the user is idle and typed 'Male'/'Female'/'Both'.
+        // It will be handled by the generic text handler if not caught by other specific hears.
+    }
+  }
+});
+
+bot.hears('Update Gender', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && userData.state === 'updating_profile' && userData.profileUpdateState === 'selecting_option') {
+    userData.profileUpdateState = 'pending_new_gender';
+    users.set(userId, userData);
+    await ctx.reply("Please select your new gender:", { reply_markup: genderReplyKeyboard.reply_markup });
+  } else if (userData && userData.state !== 'updating_profile') {
+     await ctx.reply("Please use the /update_profile command to start updating your profile.", { reply_markup: removeKeyboard.reply_markup });
+  }
+  // If in 'updating_profile' but not 'selecting_option', means they are in another update flow, so ignore.
+});
+
+bot.hears('Update Age', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && userData.state === 'updating_profile' && userData.profileUpdateState === 'selecting_option') {
+    userData.profileUpdateState = 'pending_new_age';
+    users.set(userId, userData);
+    await ctx.reply("Please enter your new age (e.g., 25).", { reply_markup: removeKeyboard.reply_markup });
+  } else if (userData && userData.state !== 'updating_profile') {
+     await ctx.reply("Please use the /update_profile command to start updating your profile.", { reply_markup: removeKeyboard.reply_markup });
+  }
+});
+
+bot.hears('Update Location', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && userData.state === 'updating_profile' && userData.profileUpdateState === 'selecting_option') {
+    userData.profileUpdateState = 'pending_new_location';
+    users.set(userId, userData);
+    await ctx.reply("Please share your new location.", { reply_markup: requestLocationKeyboard.reply_markup });
+  } else if (userData && userData.state !== 'updating_profile') {
+     await ctx.reply("Please use the /update_profile command to start updating your profile.", { reply_markup: removeKeyboard.reply_markup });
+  }
+});
+
+bot.hears('Update Interest', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && userData.state === 'updating_profile' && userData.profileUpdateState === 'selecting_option') {
+    userData.profileUpdateState = 'pending_new_interest';
+    users.set(userId, userData);
+    await ctx.reply("Please select your new interest:", { reply_markup: interestedInKeyboard.reply_markup });
+  } else if (userData && userData.state !== 'updating_profile') {
+     await ctx.reply("Please use the /update_profile command to start updating your profile.", { reply_markup: removeKeyboard.reply_markup });
+  }
+});
+
+bot.hears('Back to Main Menu', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && (userData.state === 'updating_profile' || userData.profileUpdateState)) {
+    userData.state = 'idle';
+    userData.profileUpdateState = null;
+    users.set(userId, userData);
+    await ctx.reply("Returning to main menu.", { reply_markup: removeKeyboard.reply_markup });
+    await maybeStartOnboarding(ctx); // This will show the main welcome for completed users
+  } else {
+    // If not in update mode, this button press might be stray, show main menu anyway or ignore.
+    await maybeStartOnboarding(ctx);
+  }
+});
+
+
+// Handle Location Input for Onboarding
+bot.on('location', async (ctx) => {
+  const userCtx = ensureUserInitialized(ctx);
+  if (!userCtx) return;
+
+  const userId = userCtx.userObject.id;
+  const userData = users.get(userId);
+
+  if (userData && userData.onboardingState === 'pending_location') {
+    userData.location = {
+      latitude: ctx.message.location.latitude,
+      longitude: ctx.message.location.longitude
+    };
+    userData.onboardingState = 'pending_interested_in';
+    users.set(userId, userData);
+    await saveUsers(); // PERSISTENCE
+    await ctx.reply("Location received. Thank you!", { reply_markup: removeKeyboard.reply_markup });
+    await handleOnboarding(ctx);
+  } else if (userData && userData.profileUpdateState === 'pending_new_location') {
+    userData.location = {
+      latitude: ctx.message.location.latitude,
+      longitude: ctx.message.location.longitude
+    };
+    users.set(userId, userData);
+    await saveUsers(); // PERSISTENCE
+    userData.profileUpdateState = 'selecting_option';
+    await ctx.reply("Location updated successfully!", { reply_markup: updateProfileKeyboard.reply_markup });
+  } else {
+    // Location shared outside of the specific onboarding or update step.
+    if (userData && userData.state !== 'chatting' && userData.state !== 'updating_profile') {
+      await ctx.reply("Thanks for sharing your location, but I wasn't expecting it right now.", { reply_markup: removeKeyboard.reply_markup });
+    }
+    // If in chat, the main message handler will forward it.
+    // If in 'updating_profile' but not 'pending_new_location', it's an unexpected location share.
+  }
+});
+
 // Handle all media and message types
 bot.on(['text', 'photo', 'video', 'animation', 'audio', 'voice', 'video_note', 'document', 'sticker', 'location', 'contact', 'poll', 'dice'], async (ctx) => {
   const userCtx = ensureUserInitialized(ctx);
@@ -531,10 +916,46 @@ bot.on(['text', 'photo', 'video', 'animation', 'audio', 'voice', 'video_note', '
   
   const userId = userCtx.userObject.id;
   const userData = users.get(userId);
-  
+
+  // If a location was handled by the specific 'location' onboarding handler, don't process it again here.
+  if (ctx.message.location && userData && userData.onboardingState === 'pending_interested_in') { //
+      // This means location was just processed by the specific handler, and state moved to pending_interested_in
+      // Avoid treating it as a message to forward or an error.
+      return;
+  }
+
+
   // Handle text messages specifically
   if (ctx.message.text) {
-    const messageText = ctx.message.text;
+    const messageText = ctx.message.text.trim(); // Trim whitespace
+
+    // Onboarding: Age Input
+    if (userData && userData.onboardingState === 'pending_age') {
+      const age = parseInt(messageText, 10);
+      if (isNaN(age) || age < 13 || age > 99) {
+        await ctx.reply("Invalid age. Please enter a number between 13 and 99.");
+        return;
+      }
+      userData.age = age;
+      userData.onboardingState = 'pending_location';
+      users.set(userId, userData);
+      await saveUsers(); // PERSISTENCE
+      await ctx.reply(`Age set to: ${age}.`);
+      await handleOnboarding(ctx);
+      return;
+    } else if (userData && userData.profileUpdateState === 'pending_new_age') {
+      const age = parseInt(messageText, 10);
+      if (isNaN(age) || age < 13 || age > 99) {
+        await ctx.reply("Invalid age. Please enter a number between 13 and 99.");
+        return;
+      }
+      userData.age = age;
+      users.set(userId, userData);
+      await saveUsers(); // PERSISTENCE
+      userData.profileUpdateState = 'selecting_option';
+      await ctx.reply(`Age updated to: ${age}.`, { reply_markup: updateProfileKeyboard.reply_markup });
+      return;
+    }
     
     // Block commands from being forwarded
     if (messageText.startsWith('/')) {
@@ -587,14 +1008,17 @@ bot.on(['text', 'photo', 'video', 'animation', 'audio', 'voice', 'video_note', '
   
   // Forward message or media
   try {
-    let success = false;
+    // Send 'typing...' action to the recipient before sending the actual message
+    await bot.telegram.sendChatAction(partnerId, 'typing');
     
+    // Optional: Add a small delay if desired, e.g., await new Promise(resolve => setTimeout(resolve, 300));
+
+    let success = false;
     if (ctx.message.text) {
-      // Forward text message
       await bot.telegram.sendMessage(partnerId, ctx.message.text);
       success = true;
     } else {
-      // Forward media
+      // Forward media (ensure forwardMedia doesn't also send chat actions if it were more complex)
       success = await forwardMedia(ctx, partnerId);
     }
     
@@ -703,6 +1127,9 @@ bot.action('share_no', async (ctx) => {
     .catch(console.error);
 });
 
+// Load users at startup
+loadUsers();
+
 // Start the bot
 console.log('Starting Anonymous Chat Bot...');
 
@@ -717,8 +1144,9 @@ bot.launch()
   });
 
 // Graceful shutdown
-const shutdown = (signal) => {
+const shutdown = async (signal) => {
   console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+  await saveUsers(); // Save users before exiting
   bot.stop(signal);
   process.exit(0);
 };
