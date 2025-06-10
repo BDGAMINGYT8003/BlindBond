@@ -1,718 +1,326 @@
 
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf'); // Markup might be used by handlers
+const {
+  RATE_LIMIT_WINDOW,
+  MAX_MESSAGES_IN_WINDOW,
+  USERNAME_SHARE_COOLDOWN,
+  MAX_USERNAME_SHARES,
+  MAX_MESSAGE_LENGTH,
+  prohibitedKeywords,
+  chatActiveKeyboard,
+  searchingKeyboard,
+  shareConfirmKeyboard,
+  removeKeyboard,
+} = require('./src/utils/constants');
+const { escapeMarkdown, formatDuration } = require('./src/utils/helpers'); // May not be needed directly in bot.js anymore
+const { handleStartCommand } = require('./src/handlers/commandHandler');
+const { routeOnboardingMessage } = require('./src/handlers/onboardingHandler');
+const User = require('./src/models/user'); // Required for checking user state in generic message handlers
 
 // Bot token - replace with environment variable in production
-const BOT_TOKEN = '7947606721:AAGxfrYl1HI86IRkYKbIyhwkmq4cu2Pb-vo';
+const BOT_TOKEN = process.env.BOT_TOKEN || '7947606721:AAGxfrYl1HI86IRkYKbIyhwkmq4cu2Pb-vo';
 
 // Initialize the bot
 const bot = new Telegraf(BOT_TOKEN);
 
-// Data structures
-const users = new Map(); // userId -> { state: 'idle'/'waiting'/'chatting', userObject: ctx.from }
-const waitingQueue = []; // Array of user IDs waiting for partners
-const sessions = new Map(); // userId -> partnerId
-const sessionDetails = new Map(); // sessionId -> { startTime, messageCount, user1Id, user2Id }
-const usernameShareData = new Map(); // sessionId -> { user1Shares: 0, user2Shares: 0 }
+// Data structures (Old - to be removed)
+// const users = new Map(); // userId -> { state: 'idle'/'waiting'/'chatting', userObject: ctx.from }
+// const waitingQueue = []; // Array of user IDs waiting for partners (global one)
+// const sessions = new Map(); // userId -> partnerId
+// const sessionDetails = new Map(); // sessionId -> { startTime, messageCount, user1Id, user2Id }
+// const usernameShareData = new Map(); // sessionId -> { user1Shares: 0, user2Shares: 0 }
 
-// Rate limiting
+// Rate limiting (Still potentially useful, but not directly tied to old session logic)
 const messageTimestamps = new Map(); // userId -> [timestamps]
-const RATE_LIMIT_WINDOW = 5000; // 5 seconds
-const MAX_MESSAGES_IN_WINDOW = 3;
 
-// Username sharing restrictions
-const USERNAME_SHARE_COOLDOWN = 60000; // 1 minute in milliseconds
-const MAX_USERNAME_SHARES = 2; // Maximum shares per user per session
+// Helper function to check if username sharing is allowed (Old - to be removed or refactored for new system)
+// const canShareUsername = (userId) => { ... }
 
-// Helper function to check if username sharing is allowed
-const canShareUsername = (userId) => {
-  const partnerId = sessions.get(userId);
-  if (!partnerId) return { allowed: false, reason: 'No active chat' };
-  
-  const sessionId = [userId, partnerId].sort().join('-');
-  const sessionData = sessionDetails.get(sessionId);
-  
-  if (!sessionData) return { allowed: false, reason: 'Session not found' };
-  
-  // Check if 1 minute has passed since connection
-  const timeSinceConnection = Date.now() - sessionData.startTime;
-  if (timeSinceConnection < USERNAME_SHARE_COOLDOWN) {
-    const remainingTime = Math.ceil((USERNAME_SHARE_COOLDOWN - timeSinceConnection) / 1000);
-    return { 
-      allowed: false, 
-      reason: 'cooldown', 
-      remainingTime 
-    };
-  }
-  
-  // Check share count
-  const shareData = usernameShareData.get(sessionId) || { user1Shares: 0, user2Shares: 0 };
-  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
-  
-  if (shareData[userKey] >= MAX_USERNAME_SHARES) {
-    return { 
-      allowed: false, 
-      reason: 'limit_reached' 
-    };
-  }
-  
-  return { allowed: true };
-};
+// Helper function to increment username share count (Old - to be removed or refactored)
+// const incrementShareCount = (userId) => { ... }
 
-// Helper function to increment username share count
-const incrementShareCount = (userId) => {
-  const partnerId = sessions.get(userId);
-  if (!partnerId) return;
-  
-  const sessionId = [userId, partnerId].sort().join('-');
-  const sessionData = sessionDetails.get(sessionId);
-  if (!sessionData) return;
-  
-  const shareData = usernameShareData.get(sessionId) || { user1Shares: 0, user2Shares: 0 };
-  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
-  
-  shareData[userKey]++;
-  usernameShareData.set(sessionId, shareData);
-};
+// Initialize user helper (Old - to be removed)
+// const ensureUserInitialized = (ctx) => { ... }
 
-// Content filtering
-const MAX_MESSAGE_LENGTH = 500;
-const prohibitedKeywords = ['spam', 'scam', 'fake'];
+// Send conversation summary (Old - to be removed)
+// const sendConversationSummary = async (userId, partnerId, sessionId, reason = 'ended') => { ... }
 
-// Utility function to escape MarkdownV2 special characters
-const escapeMarkdown = (text) => {
-  if (typeof text !== 'string') return '';
-  return text.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-};
+// Clean up session (Old - to be removed)
+// const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') => { ... }
 
-// Format duration helper
-const formatDuration = (milliseconds) => {
-  const totalSeconds = Math.floor(milliseconds / 1000);
-  
-  if (totalSeconds < 60) {
-    return `${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`;
-  }
-  
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  
-  if (minutes < 60) {
-    if (seconds === 0) {
-      return `${minutes} minute${minutes === 1 ? '' : 's'}`;
-    }
-    return `${minutes} minute${minutes === 1 ? '' : 's'} and ${seconds} second${seconds === 1 ? '' : 's'}`;
-  }
-  
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  
-  if (remainingMinutes === 0) {
-    return `${hours} hour${hours === 1 ? '' : 's'}`;
-  }
-  return `${hours} hour${hours === 1 ? '' : 's'} and ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}`;
-};
+// Cancel search function (Old - to be removed)
+// const cancelSearch = async (ctx) => { ... }
 
-// Reply keyboards
-const chatActiveKeyboard = Markup.keyboard([
-  ['🔗 Share Username'],
-  ['🔄 End & Find New', '❌ End Chat']
-]).resize().oneTime();
+// Find partner function (Old - to be removed)
+// const findPartner = async (ctx) => { ... }
 
-const searchingKeyboard = Markup.keyboard([
-  ['❌ Cancel Search']
-]).resize().oneTime();
+// End chat function (Old - to be removed)
+// const endChat = async (ctx) => { ... }
 
-const shareConfirmKeyboard = Markup.inlineKeyboard([
-  [
-    Markup.button.callback('✅ Yes', 'share_yes'),
-    Markup.button.callback('❌ No', 'share_no')
-  ]
-]);
-
-const removeKeyboard = Markup.removeKeyboard();
-
-// Initialize user helper
-const ensureUserInitialized = (ctx) => {
-  if (!ctx.from) return null;
-  
-  const userId = ctx.from.id;
-  if (!users.has(userId)) {
-    users.set(userId, { state: 'idle', userObject: ctx.from });
-    console.log(`User ${userId} (${ctx.from.username || 'no_username'}) initialized`);
-  } else {
-    // Update user object if changed
-    const existingUser = users.get(userId);
-    existingUser.userObject = ctx.from;
-    users.set(userId, existingUser);
-  }
-  
-  return users.get(userId);
-};
-
-// Send conversation summary
-const sendConversationSummary = async (userId, partnerId, sessionId, reason = 'ended') => {
-  if (!sessionDetails.has(sessionId)) return;
-  
-  const details = sessionDetails.get(sessionId);
-  const duration = new Date() - details.startTime;
-  const formattedDuration = formatDuration(duration);
-  const messageCount = details.messageCount;
-  
-  let summaryMessage;
-  if (reason === 'error') {
-    summaryMessage = `🔚 *The conversation has ended due to a connection issue\\.*
-
-⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
-💬 *Total messages exchanged:* ${messageCount}
-
-Use /find to start a new conversation\\.`;
-  } else {
-    summaryMessage = `🔚 *The conversation has officially concluded\\.*
-
-⏱️ *Duration:* ${escapeMarkdown(formattedDuration)}
-💬 *Total messages exchanged:* ${messageCount}
-
-Thanks for using Anonymous Chat Bot\\! Use /find to start a new conversation\\.`;
-  }
-  
-  // Send to both users
-  try {
-    await bot.telegram.sendMessage(userId, summaryMessage, { 
-      parse_mode: 'MarkdownV2',
-      reply_markup: removeKeyboard.reply_markup 
-    });
-  } catch (error) {
-    console.error(`Failed to send summary to user ${userId}:`, error);
-  }
-  
-  try {
-    await bot.telegram.sendMessage(partnerId, summaryMessage, { 
-      parse_mode: 'MarkdownV2',
-      reply_markup: removeKeyboard.reply_markup 
-    });
-  } catch (error) {
-    console.error(`Failed to send summary to partner ${partnerId}:`, error);
-  }
-  
-  sessionDetails.delete(sessionId);
-};
-
-// Clean up session
-const cleanupSession = async (userId, partnerId, sessionId, reason = 'ended') => {
-  // Send summary first
-  await sendConversationSummary(userId, partnerId, sessionId, reason);
-  
-  // Clean up session data
-  sessions.delete(userId);
-  sessions.delete(partnerId);
-  usernameShareData.delete(sessionId); // Clean up username share data
-  
-  // Update user states
-  const user1Data = users.get(userId);
-  const user2Data = users.get(partnerId);
-  
-  if (user1Data) {
-    user1Data.state = 'idle';
-    users.set(userId, user1Data);
-  }
-  
-  if (user2Data) {
-    user2Data.state = 'idle';
-    users.set(partnerId, user2Data);
-  }
-};
-
-// Cancel search function
-const cancelSearch = async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  const userData = users.get(userId);
-  
-  if (!userData || userData.state !== 'waiting') {
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently searching for a partner\\.*", { reply_markup: removeKeyboard.reply_markup });
-  }
-  
-  // Remove from waiting queue
-  const queueIndex = waitingQueue.indexOf(userId);
-  if (queueIndex > -1) {
-    waitingQueue.splice(queueIndex, 1);
-    console.log(`User ${userId} cancelled search and removed from queue`);
-  }
-  
-  // Update user state
-  userData.state = 'idle';
-  users.set(userId, userData);
-  
-  // Send confirmation
-  await ctx.replyWithMarkdownV2("✅ *Search cancelled\\.*\n\nYou can use /find to search for a partner again\\.", { reply_markup: removeKeyboard.reply_markup });
-};
-
-// Find partner function (extracted for reuse)
-const findPartner = async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  
-  // Check if already in chat
-  if (sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("❌ *You're already in a chat\\!* Use /end to finish your current conversation first\\.", { reply_markup: removeKeyboard.reply_markup });
-  }
-  
-  // Check if already waiting
-  if (waitingQueue.includes(userId)) {
-    return ctx.replyWithMarkdownV2("⏳ *You're already searching for a partner\\.*\n\nUse the button below to cancel your search\\.", { reply_markup: searchingKeyboard.reply_markup });
-  }
-  
-  // Send search message with cancel option
-  await ctx.replyWithMarkdownV2("🔍 *Searching for a chat partner\\.\\.\\.*\n\n⏳ Please wait while we connect you\\.", { reply_markup: searchingKeyboard.reply_markup });
-  
-  // Add to waiting queue
-  userCtx.state = 'waiting';
-  users.set(userId, userCtx);
-  waitingQueue.push(userId);
-  
-  console.log(`User ${userId} entered waiting queue`);
-  
-  // Try to pair users
-  if (waitingQueue.length >= 2) {
-    const user1Id = waitingQueue.shift();
-    const user2Id = waitingQueue.shift();
-    
-    const user1Data = users.get(user1Id);
-    const user2Data = users.get(user2Id);
-    
-    if (!user1Data || !user2Data) {
-      console.error('User data missing during pairing');
-      return;
-    }
-    
-    // Create session
-    sessions.set(user1Id, user2Id);
-    sessions.set(user2Id, user1Id);
-    
-    // Update states
-    user1Data.state = 'chatting';
-    user2Data.state = 'chatting';
-    users.set(user1Id, user1Data);
-    users.set(user2Id, user2Data);
-    
-    // Create session details
-    const sessionId = [user1Id, user2Id].sort().join('-');
-    sessionDetails.set(sessionId, {
-      startTime: new Date(),
-      messageCount: 0,
-      user1Id,
-      user2Id
-    });
-    
-    // Initialize username share data
-    usernameShareData.set(sessionId, {
-      user1Shares: 0,
-      user2Shares: 0
-    });
-    
-    console.log(`Session started: ${sessionId}`);
-    
-    // Small delay to ensure proper message ordering
-    setTimeout(async () => {
-      // Notify both users with reply keyboard
-      const connectMessage = `🎉 *You're now connected with a stranger\\!*
-
-💬 Start chatting by sending messages, photos, videos, stickers, or any media\\.
-🔗 Use the button below to share your username if you want\\.`;
-      
-      try {
-        await bot.telegram.sendMessage(user1Id, connectMessage, {
-          parse_mode: 'MarkdownV2',
-          reply_markup: chatActiveKeyboard.reply_markup
-        });
-        
-        await bot.telegram.sendMessage(user2Id, connectMessage, {
-          parse_mode: 'MarkdownV2',
-          reply_markup: chatActiveKeyboard.reply_markup
-        });
-      } catch (error) {
-        console.error('Failed to send connection messages:', error);
-      }
-    }, 500); // 500ms delay to ensure proper ordering
-  }
-};
-
-// End chat function (extracted for reuse)
-const endChat = async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  const userData = users.get(userId);
-  
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /find to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
-  }
-  
-  const partnerId = sessions.get(userId);
-  const sessionId = [userId, partnerId].sort().join('-');
-  
-  console.log(`Session ended by user ${userId}. Session: ${sessionId}`);
-  
-  await cleanupSession(userId, partnerId, sessionId, 'ended');
-};
-
-// Helper function to forward media content
-const forwardMedia = async (ctx, partnerId) => {
-  try {
-    // Get the message object
-    const message = ctx.message;
-    
-    // Handle different media types
-    if (message.photo) {
-      await bot.telegram.sendPhoto(partnerId, message.photo[message.photo.length - 1].file_id, {
-        caption: message.caption || undefined
-      });
-    } else if (message.video) {
-      await bot.telegram.sendVideo(partnerId, message.video.file_id, {
-        caption: message.caption || undefined
-      });
-    } else if (message.animation) {
-      await bot.telegram.sendAnimation(partnerId, message.animation.file_id, {
-        caption: message.caption || undefined
-      });
-    } else if (message.audio) {
-      await bot.telegram.sendAudio(partnerId, message.audio.file_id, {
-        caption: message.caption || undefined
-      });
-    } else if (message.voice) {
-      await bot.telegram.sendVoice(partnerId, message.voice.file_id);
-    } else if (message.video_note) {
-      await bot.telegram.sendVideoNote(partnerId, message.video_note.file_id);
-    } else if (message.document) {
-      await bot.telegram.sendDocument(partnerId, message.document.file_id, {
-        caption: message.caption || undefined
-      });
-    } else if (message.sticker) {
-      await bot.telegram.sendSticker(partnerId, message.sticker.file_id);
-    } else if (message.location) {
-      await bot.telegram.sendLocation(partnerId, message.location.latitude, message.location.longitude);
-    } else if (message.contact) {
-      await bot.telegram.sendContact(partnerId, message.contact.phone_number, message.contact.first_name, {
-        last_name: message.contact.last_name || undefined
-      });
-    } else if (message.poll) {
-      const poll = message.poll;
-      await bot.telegram.sendPoll(
-        partnerId,
-        poll.question,
-        poll.options.map(option => option.text),
-        {
-          is_anonymous: poll.is_anonymous,
-          type: poll.type,
-          allows_multiple_answers: poll.allows_multiple_answers
-        }
-      );
-    } else if (message.dice) {
-      await bot.telegram.sendDice(partnerId, {
-        emoji: message.dice.emoji
-      });
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('Failed to forward media:', error);
-    return false;
-  }
-};
+// Helper function to forward media content (Old - logic moved into main handler)
+// const forwardMedia = async (ctx, partnerId) => { ... }
 
 // Error handling
 bot.catch((err, ctx) => {
   console.error(`Bot error:`, err);
-  ensureUserInitialized(ctx);
+// ensureUserInitialized(ctx); // This logic is now part of User model and command/message handlers
 });
 
-// Start command
-bot.start((ctx) => {
-  ensureUserInitialized(ctx);
-  
-  const welcomeMessage = `🤖 *Welcome to Anonymous Chat Bot\\!*
+const { handleUpdateCommand, handleMyProfileCommand } = require('./src/handlers/commandHandler');
+const {
+  startGenderUpdate,
+  startAgeUpdate,
+  startLocationUpdate,
+  startInterestUpdate,
+  cancelUpdateProcess,
+  routeUpdateMessage
+} = require('./src/handlers/updateHandler');
+const {
+  handleFindCommand: match_handleFindCommand, // Renamed to avoid conflict
+  handleCancelSearchCommand,
+  handleEndChatCommand,
+  getSessionById: match_getSessionById,
+} = require('./src/handlers/matchingHandler');
+const { handleReportCommand } = require('./src/handlers/commandHandler');
+const { handleReportYes, handleReportNo } = require('./src/handlers/actionHandler');
 
-🔍 Use /find to find a random chat partner
-🛑 Use /end to finish your current conversation
-📝 Send text, photos, videos, stickers, and any media anonymously
 
-*Stay respectful and enjoy chatting\\!*`;
-
-  ctx.replyWithMarkdownV2(welcomeMessage, { reply_markup: removeKeyboard.reply_markup });
-});
-
-// Find chat command (renamed from /new)
-bot.command('find', findPartner);
-
-// End chat command
-bot.command('end', endChat);
-
-// Handle reply keyboard buttons
-bot.hears('🔗 Share Username', async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  const userData = users.get(userId);
-  
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("❌ *You're not currently in a chat\\.*\n\nUse /find to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
+// Command handlers
+bot.start(handleStartCommand);
+bot.command('find', async (ctx) => {
+  const user = User.findById(ctx.from.id);
+  if (user && user.isBanned && user.banUntil && new Date(user.banUntil) > new Date()) {
+    return ctx.reply(`You are temporarily banned until ${new Date(user.banUntil).toLocaleString()}.`);
+  } else if (user && user.isBanned && (!user.banUntil || new Date(user.banUntil) <= new Date())) {
+    user.update({ isBanned: false, banUntil: null }); // Unban if time is up
   }
-  
-  // Check if username sharing is allowed
-  const shareCheck = canShareUsername(userId);
-  if (!shareCheck.allowed) {
-    let errorMessage;
-    
-    if (shareCheck.reason === 'cooldown') {
-      errorMessage = `⏰ *Username sharing is not available yet\\.*\n\nYou can share your username after being connected for 1 minute\\.\n\n⏳ Please wait ${shareCheck.remainingTime} more second${shareCheck.remainingTime === 1 ? '' : 's'}\\.`;
-    } else if (shareCheck.reason === 'limit_reached') {
-      errorMessage = `🚫 *Username sharing limit reached\\.*\n\nYou can only share your username ${MAX_USERNAME_SHARES} times per conversation\\.\n\nThis helps maintain user privacy and prevents spam\\.`;
-    } else {
-      errorMessage = "❌ *Username sharing is not available right now\\.*";
-    }
-    
-    return ctx.replyWithMarkdownV2(errorMessage);
+  await match_handleFindCommand(ctx);
+});
+bot.command('update', async (ctx) => {
+  const user = User.findById(ctx.from.id);
+   if (user && user.isBanned && user.banUntil && new Date(user.banUntil) > new Date()) {
+    return ctx.reply(`You are temporarily banned until ${new Date(user.banUntil).toLocaleString()}. Feature disabled.`);
+  } else if (user && user.isBanned && (!user.banUntil || new Date(user.banUntil) <= new Date())) {
+    user.update({ isBanned: false, banUntil: null });
   }
-  
-  const username = userData.userObject?.username;
-  const displayUsername = username ? `@${username}` : 'your username';
-  
-  // Get current share count for display
-  const partnerId = sessions.get(userId);
-  const sessionId = [userId, partnerId].sort().join('-');
-  const sessionData = sessionDetails.get(sessionId);
-  const shareData = usernameShareData.get(sessionId);
-  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
-  const currentShares = shareData[userKey];
-  const remainingShares = MAX_USERNAME_SHARES - currentShares;
-  
-  const askMessage = `🤔 *Would you like to share your username?*
+  await handleUpdateCommand(ctx);
+});
+bot.command('myprofile', handleMyProfileCommand); // Ban check could be added here too if desired
+bot.command('cancelupdate', cancelUpdateProcess);
+bot.command('cancelsearch', handleCancelSearchCommand);
+bot.command('endchat', handleEndChatCommand);
+bot.command('report', handleReportCommand);
 
-Your chat partner will be able to see your username ${escapeMarkdown(displayUsername)} and contact you directly on Telegram\\.
+// Action handlers for inline keyboards
+bot.action('report_yes', handleReportYes);
+bot.action('report_no', handleReportNo);
 
-📊 *Remaining shares:* ${remainingShares}/${MAX_USERNAME_SHARES}`;
-  
-  await ctx.replyWithMarkdownV2(askMessage, { reply_markup: shareConfirmKeyboard.reply_markup });
+
+// Text-based triggers from keyboards
+// Update options
+bot.hears('Update Gender', async (ctx) => {
+    const user = User.findById(ctx.from.id);
+    if (user && user.isOnboarded() && !user.chatState) await startGenderUpdate(ctx); // Ensure not in chat/waiting
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
+    else if (!user) await handleStartCommand(ctx);
+    // If in chat/waiting, could ignore or send specific message. For now, prioritize chat/wait state.
+});
+bot.hears('Update Age', async (ctx) => {
+    const user = User.findById(ctx.from.id);
+    if (user && user.isOnboarded() && !user.chatState) await startAgeUpdate(ctx);
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
+    else if (!user) await handleStartCommand(ctx);
+});
+bot.hears('Update Location', async (ctx) => {
+    const user = User.findById(ctx.from.id);
+    if (user && user.isOnboarded() && !user.chatState) await startLocationUpdate(ctx);
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
+    else if (!user) await handleStartCommand(ctx);
+});
+bot.hears('Update Interest', async (ctx) => {
+    const user = User.findById(ctx.from.id);
+    if (user && user.isOnboarded() && !user.chatState) await startInterestUpdate(ctx);
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
+    else if (!user) await handleStartCommand(ctx);
+});
+bot.hears('Cancel Update', async (ctx) => {
+    const user = User.findById(ctx.from.id);
+    // Only cancel if user exists and is onboarded (implies they could have started an update)
+    if (user && user.isOnboarded()) await cancelUpdateProcess(ctx);
+    else if (user && !user.isOnboarded()) await routeOnboardingMessage(ctx);
+    else if (!user) await handleStartCommand(ctx);
 });
 
+// Matching options
+bot.hears('❌ Cancel Search', handleCancelSearchCommand);
+bot.hears('❌ End Chat', handleEndChatCommand);
 bot.hears('🔄 End & Find New', async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  const userData = users.get(userId);
-  
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not currently in a chat\\.*\n\nUse /find to start a new conversation\\.", { reply_markup: removeKeyboard.reply_markup });
-  }
-  
-  // End current chat first
-  await endChat(ctx);
-  
-  // Small delay to ensure cleanup is complete
-  setTimeout(async () => {
-    await findPartner(ctx);
-  }, 1000);
+  await handleEndChatCommand(ctx); // End current chat
+  await match_handleFindCommand(ctx); // Start finding new one
 });
+// Share Username is more complex, will handle with active chat logic.
 
-bot.hears('❌ End Chat', endChat);
-
-bot.hears('❌ Cancel Search', cancelSearch);
-
-// Handle all media and message types
-bot.on(['text', 'photo', 'video', 'animation', 'audio', 'voice', 'video_note', 'document', 'sticker', 'location', 'contact', 'poll', 'dice'], async (ctx) => {
-  const userCtx = ensureUserInitialized(ctx);
-  if (!userCtx) return;
-  
-  const userId = userCtx.userObject.id;
-  const userData = users.get(userId);
-  
-  // Handle text messages specifically
-  if (ctx.message.text) {
-    const messageText = ctx.message.text;
-    
-    // Block commands from being forwarded
-    if (messageText.startsWith('/')) {
-      if (userData && userData.state === 'chatting') {
-        return ctx.replyWithMarkdownV2("❌ *Commands cannot be sent to your chat partner\\.*\n\nIf you want to end the chat, use /end");
-      }
-      return; // Let Telegraf handle the command normally
-    }
-    
-    // Block reply keyboard button text from being forwarded
-    if (messageText === '🔗 Share Username' || messageText === '🔄 End & Find New' || messageText === '❌ End Chat' || messageText === '❌ Cancel Search') {
-      return; // These are handled by the hears handlers above
-    }
-    
-    // Message length check for text
-    if (messageText.length > MAX_MESSAGE_LENGTH) {
-      return ctx.replyWithMarkdownV2(`❌ *Message too long\\!*\n\nPlease keep messages under ${MAX_MESSAGE_LENGTH} characters\\.`);
-    }
-    
-    // Content filtering for text
-    const lowerMessage = messageText.toLowerCase();
-    for (const keyword of prohibitedKeywords) {
-      if (lowerMessage.includes(keyword)) {
-        console.warn(`Blocked message from ${userId} containing: ${keyword}`);
-        return ctx.replyWithMarkdownV2("🚫 *Your message was blocked\\.*\n\nPlease keep conversations respectful\\.");
-      }
-    }
-  }
-  
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    if (userData && userData.state === 'waiting') {
-      return ctx.replyWithMarkdownV2("⏳ *Please wait while we find you a chat partner\\.*");
-    }
-    return ctx.replyWithMarkdownV2("ℹ️ *You're not in a chat\\.*\n\nUse /find to start a conversation\\.", { reply_markup: removeKeyboard.reply_markup });
-  }
-  
-  const partnerId = sessions.get(userId);
-  
-  // Rate limiting
-  const now = Date.now();
-  const userTimestamps = messageTimestamps.get(userId) || [];
-  const recentTimestamps = userTimestamps.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW);
-  
-  if (recentTimestamps.length >= MAX_MESSAGES_IN_WINDOW) {
-    return ctx.replyWithMarkdownV2("⚠️ *Slow down\\!*\n\nYou're sending messages too quickly\\.");
-  }
-  
-  recentTimestamps.push(now);
-  messageTimestamps.set(userId, recentTimestamps);
-  
-  // Forward message or media
-  try {
-    let success = false;
-    
-    if (ctx.message.text) {
-      // Forward text message
-      await bot.telegram.sendMessage(partnerId, ctx.message.text);
-      success = true;
-    } else {
-      // Forward media
-      success = await forwardMedia(ctx, partnerId);
-    }
-    
-    if (success) {
-      // Increment message count
-      const sessionId = [userId, partnerId].sort().join('-');
-      const details = sessionDetails.get(sessionId);
-      if (details) {
-        details.messageCount++;
-        sessionDetails.set(sessionId, details);
-      }
-    }
-    
-  } catch (error) {
-    console.error(`Message/media delivery failed from ${userId} to ${partnerId}:`, error);
-    
-    // End session due to delivery failure
-    const sessionId = [userId, partnerId].sort().join('-');
-    await cleanupSession(userId, partnerId, sessionId, 'error');
-  }
-});
-
-// Inline keyboard handlers for username sharing confirmation
-bot.action('share_yes', async (ctx) => {
+// General message handler for text, location, and other applicable types
+bot.on(['text', 'location', 'photo', 'video', 'voice', 'sticker', 'document', 'animation'], async (ctx) => {
   const userId = ctx.from.id;
-  ensureUserInitialized(ctx);
-  
-  const userData = users.get(userId);
-  const partnerId = sessions.get(userId);
-  
-  if (!userData || userData.state !== 'chatting' || !partnerId) {
-    await ctx.answerCbQuery('This chat is no longer active.');
-    return ctx.editMessageText('❌ This chat session is no longer active\\.', { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
+  let user = User.findById(userId);
+
+  // If user doesn't exist and isn't starting with /start or a command Hears above, prompt to /start
+  const messageText = ctx.message && (ctx.message.text || ''); // Handle cases where text might be undefined (e.g. media)
+  const knownHears = ['Update Gender', 'Update Age', 'Update Location', 'Update Interest', 'Cancel Update', '❌ Cancel Search', '❌ End Chat', '🔄 End & Find New', '🔗 Share Username'];
+
+  if (!user && !messageText.startsWith('/') && !knownHears.includes(messageText) ) {
+    return ctx.reply("Welcome! Please use /start to begin.");
   }
   
-  // Double-check sharing restrictions before proceeding
-  const shareCheck = canShareUsername(userId);
-  if (!shareCheck.allowed) {
-    let errorMessage;
-    
-    if (shareCheck.reason === 'cooldown') {
-      errorMessage = `⏰ *Username sharing is not available yet\\.*\n\nPlease wait ${shareCheck.remainingTime} more second${shareCheck.remainingTime === 1 ? '' : 's'}\\.`;
-    } else if (shareCheck.reason === 'limit_reached') {
-      errorMessage = `🚫 *Username sharing limit reached\\.*\n\nYou can only share your username ${MAX_USERNAME_SHARES} times per conversation\\.`;
-    } else {
-      errorMessage = "❌ *Username sharing is not available right now\\.*";
+  // If user exists, proceed with stateful message routing
+  if (user) {
+    // Priority 1: Onboarding
+    if (!user.isOnboarded()) {
+      const messageHandledByOnboarding = await routeOnboardingMessage(ctx);
+      if (messageHandledByOnboarding) return;
+      const { handleOnboarding } = require('./src/handlers/onboardingHandler');
+      await handleOnboarding(ctx, user);
+      return;
     }
-    
-    await ctx.answerCbQuery('Sharing not allowed.');
-    return ctx.editMessageText(errorMessage, { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
+
+    // Priority 2: Profile Update
+    if (user.updateState) {
+      const messageHandledByUpdate = await routeUpdateMessage(ctx);
+      if (messageHandledByUpdate) return;
+      const { startGenderUpdate: reStartGender, startAgeUpdate: reStartAge, startLocationUpdate: reStartLoc, startInterestUpdate: reStartInt } = require('./src/handlers/updateHandler');
+      console.log(`Message not handled by update router for state: ${user.updateState}. Re-prompting.`);
+      switch (user.updateState) {
+         case 'pending_gender_update': await reStartGender(ctx); break;
+         case 'pending_age_update': await reStartAge(ctx); break;
+         case 'pending_location_update': await reStartLoc(ctx); break;
+         case 'pending_interest_update': await reStartInt(ctx); break;
+      }
+      return;
+    }
+
+    // Priority 3: Active Chat
+    if (user.chatState === 'chatting' && user.currentSessionId) {
+      const session = match_getSessionById(user.currentSessionId);
+      if (session) {
+        const partnerId = (session.user1Id === userId) ? session.user2Id : session.user1Id;
+        if (partnerId) {
+          try {
+            let chatAction = 'typing'; // Default action
+
+            if (ctx.message.photo) chatAction = 'upload_photo';
+            else if (ctx.message.video) chatAction = 'upload_video';
+            else if (ctx.message.voice) chatAction = 'record_voice';
+            else if (ctx.message.document) chatAction = 'upload_document';
+            else if (ctx.message.location) chatAction = 'find_location'; // Or 'typing' if preferred
+            else if (ctx.message.video_note) chatAction = 'record_video_note';
+            // Add more specific actions if desired e.g. record_audio, upload_audio for voice/audio files
+
+            await ctx.telegram.sendChatAction(partnerId, chatAction);
+
+            if (ctx.message.text) {
+              // Content Filtering for text messages
+              const lowerMessage = ctx.message.text.toLowerCase();
+              let isProhibited = false;
+              for (const keyword of prohibitedKeywords) {
+                if (lowerMessage.includes(keyword)) {
+                  isProhibited = true;
+                  // Log the incident
+                  const { appendLog } = require('./src/utils/storage');
+                  appendLog('moderation_log.json', {
+                    type: 'keyword_violation',
+                    timestamp: new Date().toISOString(),
+                    userId: userId,
+                    message: ctx.message.text,
+                    keyword: keyword,
+                    sessionId: user.currentSessionId,
+                  });
+                  // Warn the sender
+                  ctx.reply("Your message was not sent as it may violate our content guidelines. Please be respectful. Repeated violations may lead to penalties.");
+                  // (Optional: Increment a user-specific counter for keyword violations, which could contribute to reputation)
+                  // user.update({ keywordViolations: (user.keywordViolations || 0) + 1 });
+                  break;
+                }
+              }
+
+              if (isProhibited) {
+                return; // Stop processing/forwarding this message
+              }
+              // End of Content Filtering
+
+              if (ctx.message.text.startsWith('/') || knownHears.includes(ctx.message.text)) {
+                ctx.reply("Commands and menu buttons are not sent to your partner. Use /endchat to end the conversation.");
+                return;
+              }
+              await ctx.telegram.sendMessage(partnerId, ctx.message.text);
+            } else if (ctx.message.photo) {
+              // Note: Image moderation would require a more complex setup (e.g., AI service)
+              await ctx.telegram.sendPhoto(partnerId, ctx.message.photo[ctx.message.photo.length - 1].file_id, { caption: ctx.message.caption });
+            } else if (ctx.message.video) {
+              await ctx.telegram.sendVideo(partnerId, ctx.message.video.file_id, { caption: ctx.message.caption });
+            } else if (ctx.message.voice) {
+              await ctx.telegram.sendVoice(partnerId, ctx.message.voice.file_id);
+            } else if (ctx.message.sticker) {
+              await ctx.telegram.sendSticker(partnerId, ctx.message.sticker.file_id);
+            } else if (ctx.message.document) {
+              await ctx.telegram.sendDocument(partnerId, ctx.message.document.file_id, { caption: ctx.message.caption });
+            } else if (ctx.message.animation) {
+              await ctx.telegram.sendAnimation(partnerId, ctx.message.animation.file_id, { caption: ctx.message.caption });
+            } else if (ctx.message.location) {
+               await ctx.telegram.sendLocation(partnerId, ctx.message.location.latitude, ctx.message.location.longitude);
+            } else if (ctx.message.video_note) {
+               await ctx.telegram.sendVideoNote(partnerId, ctx.message.video_note.file_id);
+            }
+            else {
+              console.log("Attempted to forward unhandled message type:", ctx.message);
+              ctx.reply("This message type cannot be forwarded.");
+            }
+          } catch (error) {
+            console.error(`Failed to forward message from ${userId} to ${partnerId}:`, error);
+            // Check if partner blocked the bot or other issues
+            if (error.code === 403) { // Forbidden: bot was blocked by the user
+                ctx.reply("Your partner may have disconnected or blocked the bot. Ending chat.");
+                await handleEndChatCommand(ctx, 'partner_disconnected_or_blocked');
+            } else {
+                ctx.reply("Could not send your message. Please try again.");
+            }
+          }
+          return; // Message handled by forwarding
+        }
+      } else {
+        // Session ID exists on user but not in sessions.json (data inconsistency)
+        console.error(`User ${userId} in chatting state but session ${user.currentSessionId} not found.`);
+        user.update({ chatState: 'idle', currentSessionId: null });
+        ctx.reply("There was an issue with your chat session. It has been ended. Please use /find to start a new one.", Markup.removeKeyboard());
+        return;
+      }
+    }
+
+    // Priority 4: User is idle, not a command, not an onboarding/update message
+    if (user.chatState === 'idle' && messageText && !messageText.startsWith('/') && !knownHears.includes(messageText)) {
+      // console.log(`Message from idle user ${userId}: ${messageText}`);
+      // ctx.reply("Not sure what to do with that. Use /find to find a partner, or /update to change your profile.");
+    }
   }
-  
-  const username = userData.userObject?.username;
-  if (!username) {
-    await ctx.answerCbQuery('No username found.');
-    return ctx.editMessageText('❌ *You don\'t have a username set\\.*\n\nPlease set a username in your Telegram settings first\\.', { parse_mode: 'MarkdownV2' })
-      .catch(console.error);
-  }
-  
-  await ctx.answerCbQuery('Sharing username...');
-  
-  // Increment share count
-  incrementShareCount(userId);
-  
-  // Get updated share count for display
-  const sessionId = [userId, partnerId].sort().join('-');
-  const sessionData = sessionDetails.get(sessionId);
-  const shareData = usernameShareData.get(sessionId);
-  const userKey = sessionData.user1Id === userId ? 'user1Shares' : 'user2Shares';
-  const currentShares = shareData[userKey];
-  const remainingShares = MAX_USERNAME_SHARES - currentShares;
-  
-  // Send username to partner (username in @mention is NOT escaped)
-  const partnerMessage = `🔗 *Your chat partner shared their username:*\n\n@${username}\n\nTap to view their profile\\!`;
-  
-  await bot.telegram.sendMessage(partnerId, partnerMessage, { parse_mode: 'MarkdownV2' })
-    .catch(console.error);
-  
-  // Confirm to sender (username in display text IS escaped)
-  let confirmMessage = `✅ *Username shared successfully\\!*\n\nYour username @${escapeMarkdown(username)} has been sent to your chat partner\\.`;
-  
-  if (remainingShares > 0) {
-    confirmMessage += `\n\n📊 *Remaining shares:* ${remainingShares}/${MAX_USERNAME_SHARES}`;
-  } else {
-    confirmMessage += `\n\n🚫 *You have reached the maximum sharing limit for this conversation\\.*`;
-  }
-  
-  await ctx.editMessageText(confirmMessage, { parse_mode: 'MarkdownV2' })
-    .catch(console.error);
+  // If !user and it's /start, it's handled by bot.start (defined by Telegraf).
+  // If !user and a Hears that calls handleStartCommand, it's handled.
 });
 
-bot.action('share_no', async (ctx) => {
-  const userId = ctx.from.id;
-  ensureUserInitialized(ctx);
-  
-  const userData = users.get(userId);
-  if (!userData || userData.state !== 'chatting' || !sessions.has(userId)) {
-    await ctx.answerCbQuery('This chat is no longer active.');
-    return ctx.deleteMessage().catch(console.error);
-  }
-  
-  await ctx.answerCbQuery('Username not shared.');
-  await ctx.editMessageText('👍 *Your username was not shared\\.*\n\nYou can continue chatting anonymously\\.', { parse_mode: 'MarkdownV2' })
-    .catch(console.error);
-});
+// TODO: Load other handlers (e.g., for inline queries)
+const { initializeMatchingState, tryMatchUsers: startupTryMatch } = require('./src/handlers/matchingHandler');
 
 // Start the bot
 console.log('Starting Anonymous Chat Bot...');
 
-bot.launch()
-  .then(() => {
-    console.log('✅ Bot started successfully!');
-    console.log('Users can now use /start to begin chatting.');
-  })
-  .catch((err) => {
-    console.error('❌ Failed to start bot:', err);
+bot.launch().then(async () => {
+  console.log('✅ Bot started successfully!');
+  // Pass bot.telegram directly for tryMatchUsers if needed by initializeMatchingState
+  await initializeMatchingState(bot.telegram);
+  // Optionally, call tryMatchUsers directly again if initializeMatchingState doesn't or if you want a separate call
+  // await startupTryMatch(bot.telegram); // This would attempt matching immediately after init
+  console.log('Users can now use /start to begin chatting.');
+}).catch(err => {
+  console.error('❌ Failed to start bot:', err);
     process.exit(1);
   });
 
@@ -726,4 +334,5 @@ const shutdown = (signal) => {
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-console.log('Bot setup complete. Waiting for launch...');
+// Ensure this is the last log before launch (or remove if bot runs continuously)
+// console.log('Bot setup complete. Waiting for launch...');
